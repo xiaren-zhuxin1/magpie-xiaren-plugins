@@ -5133,8 +5133,8 @@ test("chat carries the kernel's remaining identity headers (X-Encrypt-Capable, s
 test("kernelVersion reads the build from the kernel file name, else says nothing", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codearts-kernel-"))
   try {
-    fs.writeFileSync(path.join(dir, "AgentKernel_Vscode_26_11_200_126_11_2-20260101000000.exe"), "")
-    assert.equal(x.kernelVersion({ env: {}, root: dir }), "126.11.2-20260101000000")
+    fs.writeFileSync(path.join(dir, "AgentKernel_Vscode_26_11_200_126_11_2-20261117200150.exe"), "")
+    assert.equal(x.kernelVersion({ env: {}, root: dir }), "126.11.2-20261117200150")
     // nothing to read: no invented version
     assert.equal(x.kernelVersion({ env: {}, root: path.join(dir, "missing") }), "")
     // an explicit override wins

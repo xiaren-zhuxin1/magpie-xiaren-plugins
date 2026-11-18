@@ -512,7 +512,7 @@ function modelDisplayName(modelId, state) {
 
 /**
  * The KERNEL's own version, the string it puts in User-Agent
- * (`opencode/126.11.2-20260101000000`). The IDE's product.json names a different
+ * (`opencode/126.11.2-20261117200150`). The IDE's product.json names a different
  * one (26.11.200), so this is a separate fact: the kernel build the IDE keeps as
  * `~/.codeartsdoer/CodeArts_Agent/AgentKernel_<ide>_<ver>-<build>.exe`. ""
  * when it cannot be read, and then no User-Agent is invented.
