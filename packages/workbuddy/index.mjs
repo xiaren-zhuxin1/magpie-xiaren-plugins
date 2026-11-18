@@ -87,8 +87,9 @@ const readPackageJson = (file) => {
   }
 }
 
-// Where the app is, when someone says so: MAGPIE_WORKBUDDY_DIR (for example
-// "D:\\WorkBuddy"). Unset means the constants answer instead.
+// Where the app is, when someone says so: MAGPIE_WORKBUDDY_DIR (for example a
+// Windows install root such as "<drive>:\\<WorkBuddy>"). Unset means the
+// constants answer instead.
 const workbuddyDir = () => String(process.env[WORKBUDDY_DIR_ENV] ?? "").trim()
 
 /** The app's own version, from the manifest its installer left; "" when unread. */
