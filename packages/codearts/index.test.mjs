@@ -5178,3 +5178,36 @@ test("user-msg-id takes the kernel's shape: msg_, 12 hex, 14 base62", () => {
   // and both headers carry the same id
   assert.equal(typeof x.newMessageId, "function")
 })
+
+test("clientVersion never guesses: unreadable means empty, so the version headers are left off", () => {
+  // no env override, no readable IDE: no snapshot fallback to contradict a
+  // request that seals its body (a 26.11.200 behaviour)
+  assert.equal(x.clientVersion({ env: {}, ideDir: "" }), "")
+  assert.equal(x.clientVersion({ env: {}, ideDir: path.join(os.tmpdir(), "no-ide-there") }), "")
+  // an explicit override, or a readable IDE, is still honoured
+  assert.equal(x.clientVersion({ env: { MAGPIE_CODEARTS_CLIENT_VERSION: "26.11.999" } }), "26.11.999")
+
+  // the old stale constant is gone from the module surface
+  assert.equal(x.CLIENT_VERSION_FALLBACK, undefined)
+})
+
+test("with no version to claim, the chat leaves those three headers off and still names the client", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push(new Headers(init.headers))
+    return sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  const h = seen[0]
+  // the identity that needs no version is still there
+  assert.equal(h.get("plugin-name"), "codemate_vscode")
+  assert.equal(h.get("ide-name"), "VSCode")
+  assert.equal(h.get("x-ot-client-type"), "IDE")
+  // and nothing claims a version this process could not read
+  for (const k of ["plugin-version", "ide-version", "x-ot-client-version"]) {
+    const v = h.get(k)
+    assert.ok(v === null || v === "26.11.200", `${k} must be absent or the real build, got ${v}`)
+  }
+})

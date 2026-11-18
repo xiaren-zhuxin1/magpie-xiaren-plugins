@@ -206,8 +206,9 @@ rate), shown as `DeepSeek-V4.1-Flash-1017`, not folded into `DeepSeek-V4.1-Flash
   `client-ip`. All are unsigned (set after signing, like the headers above), so a signature
   never covers them. The version is the IDE's own build: read from the installed IDE's
   `resources/app/product.json` when `MAGPIE_CODEARTS_IDE_DIR` is set, else
-  `MAGPIE_CODEARTS_CLIENT_VERSION`, else the snapshot this release shipped with — set the env
-  var, or the plugin keeps claiming that build after an IDE upgrade.
+  `MAGPIE_CODEARTS_CLIENT_VERSION` — and with neither, those three headers are left off
+  rather than guessed: a claimed 26.11.100 beside a sealed body (a 26.11.200 behaviour)
+  would be a contradiction, where a missing header only reads as a version difference.
   `MAGPIE_CODEARTS_CLIENT_IP=off` leaves `client-ip` off (behind a proxy the address this host
   sees is not the one the request leaves from).
 - **One conversation is one upstream session** (since 0.3.25). The real kernel sends its
@@ -387,7 +388,7 @@ when `MAGPIE_CODEARTS_IDE_DIR` is set. On startup the plugin logs the resolved v
 | `MAGPIE_CODEARTS_PLUGIN_NAME` | `snap_AIIDE` | Override the `plugin-name` sent on the authorize URL. |
 | `MAGPIE_CODEARTS_PLUGIN_VERSION` | from the IDE when `MAGPIE_CODEARTS_IDE_DIR` is set, else `5.2.0` | Override the `plugin-version`. |
 | `MAGPIE_CODEARTS_THEME` | `2` | Override `theme` (`activeColorTheme.kind`: 1 = Light, 2 = Dark). The plugin does **not** read the host's current theme; use this to match a Light-theme IDE. |
-| `MAGPIE_CODEARTS_CLIENT_VERSION` | the IDE's `product.json` when `MAGPIE_CODEARTS_IDE_DIR` is set, else `26.11.100` | What chat claims as `plugin-version` / `ide-version`. Set it after an IDE upgrade if the IDE directory is not configured. |
+| `MAGPIE_CODEARTS_CLIENT_VERSION` | the IDE's `product.json` when `MAGPIE_CODEARTS_IDE_DIR` is set; with neither, nothing is claimed (those headers are left off) | What chat claims as `plugin-version` / `ide-version`. Set it when the IDE directory is not configured. |
 | `MAGPIE_CODEARTS_CLIENT_IP` | _(unset)_ | `off` leaves `client-ip` off — for use behind a proxy, where the address this host sees is not the one the request leaves from. |
 
 Resolution is cached for the life of the process, so an IDE upgrade or an env change takes effect
@@ -456,7 +457,7 @@ measurements and code of [HuHong-Tao](https://github.com/yuweihao17/codearts/pul
   0.2.4 起所有模型都声明为只收文本（码道对图片回 `InferHub.001001020.406`「The request model is not multimodal」），
   magpie 会替模型描述图片或把图片略去；这个拒绝不论放在 200 里还是带别的状态码，都换算为 `400`，而不是让智能体反复重试的 `502`。
 - **X-Language**（0.3.24 起）：所有签名请求都带同一个 `X-Language`，在**签名之后**设置，因此不进入 `SignedHeaders`。它跟随 IDE 语言（默认 `zh-cn`），不随站点——真实内核在国际站、中文 IDE 下发的也是 `zh-cn`。英文 IDE 用环境变量 `MAGPIE_CODEARTS_LOCALE=en-us` 覆盖。对话请求不发 `lang`、`Chat-Id`、`Session-Id`，会话只认 `x-ot-session-id`。
-- **客户端身份**（0.3.25 起）：每个对话请求还带上真实内核自报的身份，取自 2026-11-17 实测的 `[header-debug] full headers`：`x-ot-client-type: IDE`、`x-ot-client-version`、`plugin-name: codemate_vscode`、`plugin-version`、`ide-name: VSCode`、`ide-version`、空值 `x-ot-function`、`model-id`/`model-name`、每请求新的 `user-msg-id` 与 `created-time`，以及本机私网 IPv4 的 `client-ip`。这些都在签名之后设置，不进入 `SignedHeaders`。版本号取自本机 IDE 的 `resources/app/product.json`（设了 `MAGPIE_CODEARTS_IDE_DIR` 时），否则 `MAGPIE_CODEARTS_CLIENT_VERSION`，再否则用本版内置的快照——**不设环境变量，IDE 升级后插件仍会自报旧版本**。`MAGPIE_CODEARTS_CLIENT_IP=off` 可关掉 `client-ip`（走代理时本机看到的地址与出口地址不一致）。
+- **客户端身份**（0.3.25 起，0.3.26 补齐）：每个对话请求还带上真实内核自报的身份，取自 `[header-debug] full headers` 实测：`x-ot-client-type: IDE`、`x-ot-client-version`、`plugin-name: codemate_vscode`、`plugin-version`、`ide-name: VSCode`、`ide-version`、`x-ot-function: agent-claw`、`x-message-id`、`model-id`/`model-name`（显示名，URL 编码）、每请求新的 `user-msg-id` 与 `created-time`、`x-session-affinity`、`x-session-user-message`、`X-Encrypt-Capable`、`User-Agent: opencode/<内核build>`，以及本机私网 IPv4 的 `client-ip`。这些都在签名之后设置，不进入 `SignedHeaders`。会话 id 用内核的 `ses_`+24 位形态，消息 id 用 `msg_`+12 位 hex+14 位形态。**版本号只从本机 IDE 的 `resources/app/product.json` 或 `MAGPIE_CODEARTS_CLIENT_VERSION` 取；两者都没有时，`plugin-version`/`ide-version`/`x-ot-client-version` 全部不发**——猜一个旧版本（如 26.11.100）却用着 26.11.200 才有的加密，会构成自相矛盾，而缺一个头只算版本差异。`MAGPIE_CODEARTS_CLIENT_IP=off` 可关掉 `client-ip`（走代理时本机看到的地址与出口地址不一致）。
 - **一个对话一个上游会话**（0.3.25 起）：真实内核把对话 ID 放在 `x-ot-session-id`，所以每个对话各占账号三个会话额度中的一个，而不是全账号共用一个 id。账号维护至多三个 id 的池：对话活跃期间及静默 `90` 秒内保持自己的 id（网关会持有已结束的会话约一分钟），之后才可能把槽位让给别的对话——这样第 4 个对话也不会开出网关会拒绝的会话（`TM.00001041`）。
 - **用量与签到**：总积分决定账号是否可用，其余积分桶只做明细；另有每日免费额度窗口。各批积分的到期
   时间读自码道控制台同一批接口，读不到时退回插件的签到账本 `~/.config/magpie/codearts-checkins.json`
@@ -510,4 +511,3 @@ measurements and code of [HuHong-Tao](https://github.com/yuweihao17/codearts/pul
 ## License
 
 MIT — see [LICENSE](./LICENSE).
-

@@ -242,11 +242,10 @@ const ACCOUNT_MAX_INFLIGHT = 3
 // headers that say "this is the official IDE plugin", not just "a signed
 // request": without them a caller is signed but anonymous. They are unsigned —
 // set after signFor(), so they change no signature. The version follows the
-// IDE: read from the installed one when available, else this snapshot.
+// IDE: read from the installed one when available; never a guessed snapshot.
 const CLIENT_TYPE = "IDE"
 const CLIENT_PLUGIN_NAME = "codemate_vscode"
 const CLIENT_IDE_NAME = "VSCode"
-const CLIENT_VERSION_FALLBACK = "26.11.100"
 // The IDE version this client claims. MAGPIE_CODEARTS_CLIENT_VERSION overrides
 // it; otherwise the installed CodeArts Agent's own product.json wins, so an
 // upgraded IDE does not leave the plugin claiming an old build.
@@ -466,8 +465,12 @@ function oauthFingerprint(options = {}) {
 
 /**
  * The IDE version the chat client claims (the real kernel's `plugin-version`
- * and `ide-version` are both the IDE build, e.g. 26.11.100). Order: env
- * override > the installed CodeArts Agent's product.json > the snapshot below.
+ * and `ide-version` are both the IDE build, e.g. 26.11.200). Order: env
+ * override > the installed CodeArts Agent's product.json. There is NO snapshot
+ * fallback: a guessed version could contradict what the request does (claiming
+ * 26.11.100 while sealing the body, which only a 26.11.200 client does), so an
+ * unreadable version leaves those headers off - the same policy as User-Agent.
+ * A missing header reads as a version difference; a contradicted one does not.
  * Cached for the life of the process, like the login fingerprint.
  */
 let _clientVersion
@@ -493,8 +496,8 @@ function clientVersion(options = {}) {
       }
     }
   }
-  const resolved = version || CLIENT_VERSION_FALLBACK
-  log(`CodeArts chat client: plugin-name=${CLIENT_PLUGIN_NAME}, plugin-version=${resolved} (${source || "fallback"}), ide-name=${CLIENT_IDE_NAME}`)
+  const resolved = version || ""
+  log(`CodeArts chat client: plugin-name=${CLIENT_PLUGIN_NAME}, plugin-version=${resolved || "(unknown, the version headers are left off)"} (${source || "unreadable"}), ide-name=${CLIENT_IDE_NAME}`)
   if (!options.env && !options.ideDir) _clientVersion = resolved
   return resolved
 }
@@ -2597,13 +2600,17 @@ async function signedFetch(cred, input, init, context) {
     headers.set("x-ot-trace-id", traceId)
     headers.set("x-snap-traceid", `${traceId}_${randomHex(8)}`)
     headers.set("x-ot-span-id", randomHex(8))
+    // The IDE version this request claims. Left off entirely when it cannot
+    // be read: a guessed one could contradict what the request does (sealing the
+    // body is a 26.11.200 behaviour), and a missing header reads as a version
+    // difference where a contradicted one does not.
     const version = clientVersion()
     headers.set("x-ot-client-type", CLIENT_TYPE)
-    headers.set("x-ot-client-version", version)
+    if (version) headers.set("x-ot-client-version", version)
     headers.set("plugin-name", CLIENT_PLUGIN_NAME)
-    headers.set("plugin-version", version)
+    if (version) headers.set("plugin-version", version)
     headers.set("ide-name", CLIENT_IDE_NAME)
-    headers.set("ide-version", version)
+    if (version) headers.set("ide-version", version)
     // The kernel names the feature here: `agent-claw` for every chat it sends
     // (measured 44/44), not an empty value.
     headers.set("x-ot-function", CHAT_OT_FUNCTION)
@@ -4547,7 +4554,7 @@ export const _internal = {
   STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, upstreamModelId, formatCredit,
   DEFAULT_LOCALE, LOCALE_ENV, codeartsLocale,
-  CLIENT_TYPE, CLIENT_PLUGIN_NAME, CLIENT_IDE_NAME, CLIENT_VERSION_FALLBACK, CLIENT_VERSION_ENV,
+  CLIENT_TYPE, CLIENT_PLUGIN_NAME, CLIENT_IDE_NAME, CLIENT_VERSION_ENV,
   CLIENT_IP_ENV, clientVersion, clientIp, kernelVersion, KERNEL_VERSION_ENV, CHAT_OT_FUNCTION, modelDisplayName, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
   b64url, utf8, sha256Hex, hmacSha256Hex,
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
@@ -5921,5 +5928,3 @@ export const _officeace = {
   renewalGates, withOfficeAceMaas, persistOfficeAceRecord,
   OFFICEACE_ICON,
 }
-
-
