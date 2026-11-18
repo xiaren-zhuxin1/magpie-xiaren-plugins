@@ -205,8 +205,9 @@ rate), shown as `DeepSeek-V4.1-Flash-1017`, not folded into `DeepSeek-V4.1-Flash
   `model-name`, a fresh `user-msg-id` and `created-time`, and the host's private IPv4 as
   `client-ip`. All are unsigned (set after signing, like the headers above), so a signature
   never covers them. The version is the IDE's own build: read from the installed IDE's
-  `resources/app/product.json` when `MAGPIE_CODEARTS_IDE_DIR` is set, else
-  `MAGPIE_CODEARTS_CLIENT_VERSION` — and with neither, those three headers are left off
+  `resources/app/product.json` of an install found on its own (env var, the
+  Windows uninstall entry, the usual places), else `MAGPIE_CODEARTS_CLIENT_VERSION`,
+  else the IDE version in the kernel file name — and with none of them, those
   rather than guessed: a claimed 26.11.100 beside a sealed body (a 26.11.200 behaviour)
   would be a contradiction, where a missing header only reads as a version difference.
   `MAGPIE_CODEARTS_CLIENT_IP=off` leaves `client-ip` off (behind a proxy the address this host
@@ -378,17 +379,18 @@ values, **only `plugin-version` is read from the IDE**; `plugin-name` and `theme
 the IDE — they are fixed (`snap_AIIDE` / `2`) unless you override them with the env vars below. The
 plugin resolves each value, in order, from (1) its env var, (2) for the version only, the installed
 IDE's `huaweicloud.authentication` extension manifest, (3) the historical fallback
-(`snap_AIIDE` / `5.2.0` / `2`). Nothing is scanned by default — version auto-discovery happens only
-when `MAGPIE_CODEARTS_IDE_DIR` is set. On startup the plugin logs the resolved value and its source
+(`snap_AIIDE` / `5.2.0` / `2`). The install is found on its own — the env var, then the
+Windows uninstall entry, then the usual place on macOS and Linux — so nobody has to set
+anything; the env var only overrides what is found. On startup the plugin logs the resolved value and its source
 (`service: codearts`) so a mis-set directory is visible rather than a silent fallback.
 
 | Env var | Default | What it does |
 |---|---|---|
-| `MAGPIE_CODEARTS_IDE_DIR` | _(unset)_ | Install root of the CodeArts Agent IDE. Only when set is `plugin-version` read from that IDE's `huaweicloud.authentication` extension `package.json` (exact id or `<id>.*`/`<id>-*` folder, under `resources/app/extensions/` or `extensions/`). Example: `C:\Program Files\CodeArts Agent`. Unlike the sign-in state database, this root cannot be derived reliably, so it must be given explicitly. |
+| `MAGPIE_CODEARTS_IDE_DIR` | _(found automatically)_ | Install root of the CodeArts Agent IDE. Found from the env var, else the Windows uninstall entry (`InstallLocation`), else `/Applications/CodeArts Agent.app/Contents` (macOS) or `/opt/codearts-agent` and `/usr/share/codearts-agent` (Linux). The auth extension's `package.json` is then read from `resources/app/extensions/huaweicloud.authentication` (exact id or `<id>.*`/`<id>-*`). Set it only to point at an install those places miss. |
 | `MAGPIE_CODEARTS_PLUGIN_NAME` | `snap_AIIDE` | Override the `plugin-name` sent on the authorize URL. |
-| `MAGPIE_CODEARTS_PLUGIN_VERSION` | from the IDE when `MAGPIE_CODEARTS_IDE_DIR` is set, else `5.2.0` | Override the `plugin-version`. |
+| `MAGPIE_CODEARTS_PLUGIN_VERSION` | from the found IDE's auth extension, else `5.2.0` | Override the `plugin-version`. |
 | `MAGPIE_CODEARTS_THEME` | `2` | Override `theme` (`activeColorTheme.kind`: 1 = Light, 2 = Dark). The plugin does **not** read the host's current theme; use this to match a Light-theme IDE. |
-| `MAGPIE_CODEARTS_CLIENT_VERSION` | the IDE's `product.json` when `MAGPIE_CODEARTS_IDE_DIR` is set; with neither, nothing is claimed (those headers are left off) | What chat claims as `plugin-version` / `ide-version`. Set it when the IDE directory is not configured. |
+| `MAGPIE_CODEARTS_CLIENT_VERSION` | the found IDE's `product.json`, else the IDE version in the kernel file name; with neither, nothing is claimed (those headers are left off) | What chat claims as `plugin-version` / `ide-version`. Overrides the discovery. |
 | `MAGPIE_CODEARTS_CLIENT_IP` | _(unset)_ | `off` leaves `client-ip` off — for use behind a proxy, where the address this host sees is not the one the request leaves from. |
 
 Resolution is cached for the life of the process, so an IDE upgrade or an env change takes effect
@@ -503,7 +505,7 @@ measurements and code of [HuHong-Tao](https://github.com/yuweihao17/codearts/pul
   有没有重启）。老 `officeace-auth` 记录同样只按自己的链续期。两个 magpie 进程同时续期同一个账号仍可能撞车，
   输的一方重试，只有 token 一直是被消费状态才标记需重新登录。
   另外，`officeace-auth` 与本包不能同时服务 `officeace` 这个 provider id，magpie 会让你选一个，装之前先卸掉旧的。
-- **登录指纹跟随本机 IDE**：OAuth 授权 URL 上的 `plugin-name`/`plugin-version`/`theme` 是客户端身份指纹。真实 IDE 不写死版本——它发的是认证扩展自己 `package.json` 的版本；写死（如 5.2.0）会在 IDE 升级后过时。**三项里只有 `plugin-version` 会从 IDE 读取**，`plugin-name`/`theme` 固定为 `snap_AIIDE`/`2`（可用环境变量覆盖；插件不读取宿主当前主题）。取值顺序：① 对应环境变量；② **仅 `plugin-version`**，且**仅在设置 `MAGPIE_CODEARTS_IDE_DIR` 时**才从本机 IDE 的 `huaweicloud.authentication` 扩展 `package.json` 读；③ 历史兜底值。默认不扫描磁盘——把 `MAGPIE_CODEARTS_IDE_DIR` 指向 IDE 安装根目录（含 `resources` 的那层，例如 `C:\Program Files\CodeArts Agent`）才会启用版本自动读取，跟随 IDE 升级。与登录状态数据库不同，安装根目录无法可靠推导，必须手动指定。解析结果（值+来源）会在启动时写进 `service: codearts` 日志，便于自查；结果按进程缓存，IDE 升级或改环境变量需重启生效。可用 `MAGPIE_CODEARTS_PLUGIN_NAME`、`MAGPIE_CODEARTS_PLUGIN_VERSION`、`MAGPIE_CODEARTS_THEME`（1=浅色，2=深色）单独覆盖任一项。
+- **登录指纹跟随本机 IDE**：OAuth 授权 URL 上的 `plugin-name`/`plugin-version`/`theme` 是客户端身份指纹。真实 IDE 不写死版本——它发的是认证扩展自己 `package.json` 的版本；写死（如 5.2.0）会在 IDE 升级后过时。**三项里只有 `plugin-version` 会从 IDE 读取**，`plugin-name`/`theme` 固定为 `snap_AIIDE`/`2`（可用环境变量覆盖；插件不读取宿主当前主题）。**安装位置自动发现，不需要任何人设置环境变量**：先看 `MAGPIE_CODEARTS_IDE_DIR`，再读 Windows 卸载项里的 `InstallLocation`，macOS 试 `/Applications/CodeArts Agent.app/Contents`，Linux 试 `/opt/codearts-agent`、`/usr/share/codearts-agent`；找到后从其 `huaweicloud.authentication` 扩展的 `package.json` 取版本。chat 版本头还有更省事的兜底：内核文件名里直接带着 IDE 版本（`AgentKernel_<x>_26_11_200_<build>.exe`）。都读不到才省略（绝不猜）。解析结果（值+来源）会写进 `service: codearts` 日志；按进程缓存，IDE 升级或改环境变量需重启生效。可用 `MAGPIE_CODEARTS_PLUGIN_NAME`、`MAGPIE_CODEARTS_PLUGIN_VERSION`、`MAGPIE_CODEARTS_THEME`（1=浅色，2=深色）单独覆盖任一项。
 - **致谢**：原作者 [yuweihao17](https://github.com/yuweihao17/codearts)；HuHong-Tao、ReachForStar 的
   实测与实现；CodeArts 渠道的原作者 [iJetLi](https://gitee.com/iJetLi)（[deepseek-harness-codearts](https://gitee.com/iJetLi/deepseek-harness-codearts)），
   以及转载它的 [Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)。

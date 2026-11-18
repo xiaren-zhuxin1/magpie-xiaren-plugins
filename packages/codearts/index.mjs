@@ -44,6 +44,7 @@
 // signed-request flow. See README.md.
 
 import { createHash, createHmac } from "node:crypto"
+import { execFileSync } from "node:child_process"
 import { createServer } from "node:http"
 import { createRequire } from "node:module"
 import fs from "node:fs"
@@ -408,6 +409,116 @@ function safeJson(text) {
   }
 }
 
+// ---- where the IDE is, without asking the user ------------------------------
+//
+// The chat version headers and the login fingerprint are read from the installed
+// IDE, and a fresh machine has no MAGPIE_CODEARTS_IDE_DIR set. So the root is
+// looked for the way the host would: the env var, the uninstall entry Windows
+// keeps for the app, then the usual place on each system. "" when nothing is
+// found - the callers then leave the version out rather than guess one.
+const IDE_DIR_ENV = "MAGPIE_CODEARTS_IDE_DIR"
+
+/** Does `root` hold the IDE's app directory (either Resources casing)? */
+function hasIdeApp(root) {
+  if (!root) return false
+  for (const rel of [["resources", "app"], ["Resources", "app"]]) {
+    try {
+      if (fs.existsSync(path.join(root, ...rel, "product.json"))) return true
+    } catch {
+      /* unreadable: not this one */
+    }
+  }
+  return false
+}
+
+/** The IDE's InstallLocation from the uninstall entry Windows keeps. */
+function windowsInstallLocation() {
+  try {
+    const roots = [
+      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+      "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+      "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    ]
+    for (const base of roots) {
+      let listing = ""
+      try {
+        listing = String(execFileSync("reg", ["query", base, "/s", "/v", "DisplayName"], { encoding: "utf8", timeout: 5000, windowsHide: true }))
+      } catch {
+        continue
+      }
+      let key = ""
+      for (const line of listing.split(/\r?\n/)) {
+        const t = line.trim()
+        if (/^HKEY_/i.test(t)) {
+          key = t
+          continue
+        }
+        if (!key || !/DisplayName\s+REG_SZ\s+.*CodeArts Agent/i.test(t)) continue
+        try {
+          const out = String(execFileSync("reg", ["query", key, "/v", "InstallLocation"], { encoding: "utf8", timeout: 5000, windowsHide: true }))
+          const m = /InstallLocation\s+REG_SZ\s+(.+)$/im.exec(out)
+          const dir = m ? m[1].trim().replace(/[\\/]+$/, "") : ""
+          if (hasIdeApp(dir)) return dir
+        } catch {
+          /* no location on this entry */
+        }
+      }
+    }
+  } catch {
+    /* no registry to read */
+  }
+  return ""
+}
+
+let _ideDir
+/** The IDE install root: env, then the host's own record, then the usual places. */
+function ideInstallDir(options = {}) {
+  if (_ideDir !== undefined && !options.env && !options.platform) return _ideDir
+  const env = options.env ?? process.env
+  const platform = options.platform ?? process.platform
+  let found = ""
+  const fromEnv = firstOf(env?.[IDE_DIR_ENV])
+  if (fromEnv && hasIdeApp(fromEnv)) found = fromEnv
+  if (!found && platform === "win32") found = windowsInstallLocation()
+  if (!found && !options.noDiscovery) {
+    const home = os.homedir()
+    const places = platform === "darwin"
+      ? ["/Applications/CodeArts Agent.app/Contents", path.join(home, "Applications", "CodeArts Agent.app", "Contents")]
+      : platform === "linux"
+        ? ["/opt/codearts-agent", "/usr/share/codearts-agent", path.join(home, ".local", "share", "codearts-agent")]
+        : []
+    found = places.find((p) => hasIdeApp(p)) ?? ""
+  }
+  if (!options.env && !options.platform) _ideDir = found
+  return found
+}
+
+/** The IDE version the kernel file name carries (AgentKernel_<x>_26_11_200_<build>.exe). */
+function ideVersionFromKernel(options = {}) {
+  const root = firstOf(options.root, path.join(os.homedir(), ".codeartsdoer", "CodeArts_Agent"))
+  let best = ""
+  let bestAt = -1
+  try {
+    for (const name of fs.readdirSync(root)) {
+      const m = /^AgentKernel_[A-Za-z0-9]+_(\d+)_(\d+)_(\d+)_\d+_\d+_\d+-\d{14}\.exe$/i.exec(name)
+      if (!m) continue
+      let at = 0
+      try {
+        at = fs.statSync(path.join(root, name)).mtimeMs
+      } catch {
+        /* unreadable entry: skip */
+      }
+      if (at > bestAt) {
+        bestAt = at
+        best = `${m[1]}.${m[2]}.${m[3]}`
+      }
+    }
+  } catch {
+    /* no kernel directory */
+  }
+  return best
+}
+
 /**
  * The login-time fingerprint sent to the portal. Resolved once and cached:
  * each field takes env override > the installed IDE's auth-extension manifest
@@ -423,7 +534,7 @@ function oauthFingerprint(options = {}) {
   const readVersion = () => {
     const override = firstOf(env?.MAGPIE_CODEARTS_PLUGIN_VERSION)
     if (override) return { version: override, source: "env MAGPIE_CODEARTS_PLUGIN_VERSION" }
-    const root = firstOf(options.ideDir, env?.MAGPIE_CODEARTS_IDE_DIR)
+    const root = firstOf(options.ideDir, env?.[IDE_DIR_ENV], options.env ? "" : ideInstallDir())
     if (!root) return {}
     // VS Code-family installs name built-in extension folders by id, but a
     // user-installed one is `<publisher>.<name>-<version>`. Match both, and try
@@ -482,23 +593,34 @@ function clientVersion(options = {}) {
   let version = override
   let source = override ? `env ${CLIENT_VERSION_ENV}` : ""
   if (!version) {
-    const root = firstOf(options.ideDir, env?.MAGPIE_CODEARTS_IDE_DIR)
-    if (root) {
+    const root = firstOf(options.ideDir, env?.[IDE_DIR_ENV], options.env ? "" : ideInstallDir())
+    for (const rel of root ? [["resources", "app"], ["Resources", "app"]] : []) {
       try {
-        const json = safeJson(fs.readFileSync(path.join(root, "resources", "app", "product.json"), "utf8"))
+        const json = safeJson(fs.readFileSync(path.join(root, ...rel, "product.json"), "utf8"))
         const v = firstOf(json?.version)
         if (v) {
           version = v
-          source = "IDE product.json"
+          source = `IDE ${rel.join("/")}/product.json`
+          break
         }
       } catch {
-        /* no readable IDE there */
+        /* not this casing */
       }
+    }
+  }
+  if (!version) {
+    // A last resort that needs no configuration at all: the file the IDE keeps
+    // its kernel under carries the IDE version in its name
+    // (AgentKernel_<x>_26_11_200_<build>.exe).
+    const derived = ideVersionFromKernel({ root: options.kernelDir })
+    if (derived) {
+      version = derived
+      source = "kernel file name"
     }
   }
   const resolved = version || ""
   log(`CodeArts chat client: plugin-name=${CLIENT_PLUGIN_NAME}, plugin-version=${resolved || "(unknown, the version headers are left off)"} (${source || "unreadable"}), ide-name=${CLIENT_IDE_NAME}`)
-  if (!options.env && !options.ideDir) _clientVersion = resolved
+  if (!options.env && !options.ideDir && !options.kernelDir) _clientVersion = resolved
   return resolved
 }
 
@@ -4554,7 +4676,7 @@ export const _internal = {
   STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, upstreamModelId, formatCredit,
   DEFAULT_LOCALE, LOCALE_ENV, codeartsLocale,
-  CLIENT_TYPE, CLIENT_PLUGIN_NAME, CLIENT_IDE_NAME, CLIENT_VERSION_ENV,
+  CLIENT_TYPE, CLIENT_PLUGIN_NAME, CLIENT_IDE_NAME, CLIENT_VERSION_ENV, IDE_DIR_ENV, ideInstallDir, ideVersionFromKernel,
   CLIENT_IP_ENV, clientVersion, clientIp, kernelVersion, KERNEL_VERSION_ENV, CHAT_OT_FUNCTION, modelDisplayName, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
   b64url, utf8, sha256Hex, hmacSha256Hex,
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,

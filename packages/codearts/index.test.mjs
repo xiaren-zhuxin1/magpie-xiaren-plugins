@@ -5182,8 +5182,9 @@ test("user-msg-id takes the kernel's shape: msg_, 12 hex, 14 base62", () => {
 test("clientVersion never guesses: unreadable means empty, so the version headers are left off", () => {
   // no env override, no readable IDE: no snapshot fallback to contradict a
   // request that seals its body (a 26.11.200 behaviour)
-  assert.equal(x.clientVersion({ env: {}, ideDir: "" }), "")
-  assert.equal(x.clientVersion({ env: {}, ideDir: path.join(os.tmpdir(), "no-ide-there") }), "")
+  const noKernel = path.join(os.tmpdir(), "codearts-no-kernel-here")
+  assert.equal(x.clientVersion({ env: {}, ideDir: "", kernelDir: noKernel }), "")
+  assert.equal(x.clientVersion({ env: {}, ideDir: path.join(os.tmpdir(), "no-ide-there"), kernelDir: noKernel }), "")
   // an explicit override, or a readable IDE, is still honoured
   assert.equal(x.clientVersion({ env: { MAGPIE_CODEARTS_CLIENT_VERSION: "26.11.999" } }), "26.11.999")
 
@@ -5210,4 +5211,27 @@ test("with no version to claim, the chat leaves those three headers off and stil
     const v = h.get(k)
     assert.ok(v === null || v === "26.11.200", `${k} must be absent or the real build, got ${v}`)
   }
+})
+test("the IDE is found without anyone setting an env var: registry, then the kernel file name", () => {
+  // a fake kernel install: the file name carries both versions
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codearts-kernelname-"))
+  try {
+    fs.writeFileSync(path.join(dir, "AgentKernel_Vscode_26_10_300_126_10_3-20260101000000.exe"), "")
+    assert.equal(x.ideVersionFromKernel({ root: dir }), "26.10.300")
+    // and the newest file wins
+    fs.writeFileSync(path.join(dir, "AgentKernel_Vscode_26_11_200_126_11_2-20261117200150.exe"), "")
+    fs.utimesSync(path.join(dir, "AgentKernel_Vscode_26_11_200_126_11_2-20261117200150.exe"), new Date(), new Date(Date.now() + 2000))
+    assert.equal(x.ideVersionFromKernel({ root: dir }), "26.11.200")
+    // a kernel file name is enough for the chat version, with no env and no IDE dir
+    assert.equal(x.clientVersion({ env: {}, ideDir: "", kernelDir: dir }), "26.11.200")
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("ideInstallDir honours the env var and can be kept off the host's records", () => {
+  // no discovery: nothing to find, and no registry is touched
+  assert.equal(x.ideInstallDir({ env: {}, platform: "linux", noDiscovery: true }), "")
+  // an env var pointing at something that is not an IDE app is not taken
+  assert.equal(x.ideInstallDir({ env: { MAGPIE_CODEARTS_IDE_DIR: os.tmpdir() }, platform: "linux", noDiscovery: true }), "")
 })
