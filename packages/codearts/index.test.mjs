@@ -5143,3 +5143,29 @@ test("kernelVersion reads the build from the kernel file name, else says nothing
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test("x-ot-function names the feature and x-snap-traceid derives from the trace id", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push(new Headers(init.headers))
+    return sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  const h = seen[0]
+  // measured: every chat the real kernel sends names the feature this way
+  assert.equal(h.get("x-ot-function"), "agent-claw")
+  // measured 22/22: <x-ot-trace-id>_<16 hex>, not an independent random id
+  const snap = h.get("x-snap-traceid")
+  assert.match(snap, /^[0-9a-f]{32}_[0-9a-f]{16}$/)
+  assert.ok(snap.startsWith(`${h.get("x-ot-trace-id")}_`))
+})
+
+test("model-name uses the account's own display name when its list carries one", () => {
+  const state = { modelNames: new Map([["deepseek-v4.1-flash-1017", "DeepSeek-V4.1-Flash-1017"]]) }
+  assert.equal(x.modelDisplayName("deepseek-v4.1-flash-1017", state), "DeepSeek-V4.1-Flash-1017")
+  // unknown id or no list: nothing invented
+  assert.equal(x.modelDisplayName("unknown", state), "")
+  assert.equal(x.modelDisplayName("deepseek-v4.1-flash-1017", {}), "")
+})

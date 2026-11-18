@@ -251,6 +251,9 @@ const CLIENT_VERSION_FALLBACK = "26.11.100"
 // it; otherwise the installed CodeArts Agent's own product.json wins, so an
 // upgraded IDE does not leave the plugin claiming an old build.
 const CLIENT_VERSION_ENV = "MAGPIE_CODEARTS_CLIENT_VERSION"
+// What the kernel calls a chat in `x-ot-function`: the same value on every chat
+// it sends (measured 44 times in its own [header-debug] lines).
+const CHAT_OT_FUNCTION = "agent-claw"
 // `MAGPIE_CODEARTS_CLIENT_IP=off` leaves `client-ip` off. Through a proxy the
 // address this host sees and the one the request leaves from differ, and a
 // header naming one while the other is used contradicts what the kernel sends.
@@ -494,6 +497,17 @@ function clientVersion(options = {}) {
   log(`CodeArts chat client: plugin-name=${CLIENT_PLUGIN_NAME}, plugin-version=${resolved} (${source || "fallback"}), ide-name=${CLIENT_IDE_NAME}`)
   if (!options.env && !options.ideDir) _clientVersion = resolved
   return resolved
+}
+
+/**
+ * The model's display name as the account's own list carries it
+ * (`DeepSeek-V4.1-Flash-1017`), which is what the kernel puts in `model-name`.
+ * "" when the list has not been read or does not carry that id — a caller then
+ * sends the id rather than an invented name.
+ */
+function modelDisplayName(modelId, state) {
+  if (!modelId || !state?.modelNames) return ""
+  return firstOf(state.modelNames.get(String(modelId)))
 }
 
 /**
@@ -2564,9 +2578,13 @@ async function signedFetch(cred, input, init, context) {
     headers.set(SESSION_HEADER, sessionId)
     headers.set("user-session-id", sessionId)
     headers.set("x-ot-parent-session-id", "")
-    headers.set("x-ot-trace-id", randomHex(16))
+    // One trace per request, and the snap traceid is that same trace plus its own
+    // suffix (`<trace-id>_<16 hex>`, measured 22/22 on the real kernel), not an
+    // unrelated random id.
+    const traceId = randomHex(16)
+    headers.set("x-ot-trace-id", traceId)
+    headers.set("x-snap-traceid", `${traceId}_${randomHex(8)}`)
     headers.set("x-ot-span-id", randomHex(8))
-    headers.set("x-snap-traceid", randomHex(16))
     const version = clientVersion()
     headers.set("x-ot-client-type", CLIENT_TYPE)
     headers.set("x-ot-client-version", version)
@@ -2574,11 +2592,15 @@ async function signedFetch(cred, input, init, context) {
     headers.set("plugin-version", version)
     headers.set("ide-name", CLIENT_IDE_NAME)
     headers.set("ide-version", version)
-    headers.set("x-ot-function", "")
+    // The kernel names the feature here: `agent-claw` for every chat it sends
+    // (measured 44/44), not an empty value.
+    headers.set("x-ot-function", CHAT_OT_FUNCTION)
     if (model) {
       headers.set("model-id", model)
-      // 26.11.200 measures `model-name` as encodeURIComponent(model.name).
-      headers.set("model-name", encodeURIComponent(model))
+      // 26.11.200 sends the model's DISPLAY name, percent-encoded (`DeepSeek-V4.1-
+      // Flash-1017`), not its id. Use the name the account's own list carries;
+      // with none, the id is the honest stand-in.
+      headers.set("model-name", encodeURIComponent(modelDisplayName(model, context.state) || model))
     }
     const messageId = randomHex(16)
     headers.set("user-msg-id", messageId)
@@ -3442,6 +3464,12 @@ async function fetchRemoteModels(cred, fetcher, state) {
   if (state) {
     if (gateway) state.benefit = new Set(benefitIds)
     if (builtin) state.regular = new Set(regularIds)
+    // Keep the display names this read learned, so `model-name` can carry the
+    // name the kernel would send. A name already known is not dropped by a list
+    // that leaves it out.
+    for (const m of models) {
+      if (m?.id && m.name) state.modelNames?.set(String(m.id), String(m.name))
+    }
   }
   return models
 }
@@ -3979,6 +4007,9 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
     if (!accounts.has(key)) {
       accounts.set(key, {
         gate: createConcurrencyGate(maxInflight), sessionPool: createSessionPool(maxInflight), benefit: null, regular: null, noBenefit: new Set(),
+        // model id -> the display name the account's own list gave it, so
+        // `model-name` can carry the name the kernel would send.
+        modelNames: new Map(),
         claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0,
         renewing: null, renewed: null, unconfirmed: null,
       })
@@ -4505,7 +4536,7 @@ export const _internal = {
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, upstreamModelId, formatCredit,
   DEFAULT_LOCALE, LOCALE_ENV, codeartsLocale,
   CLIENT_TYPE, CLIENT_PLUGIN_NAME, CLIENT_IDE_NAME, CLIENT_VERSION_FALLBACK, CLIENT_VERSION_ENV,
-  CLIENT_IP_ENV, clientVersion, clientIp, kernelVersion, KERNEL_VERSION_ENV, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
+  CLIENT_IP_ENV, clientVersion, clientIp, kernelVersion, KERNEL_VERSION_ENV, CHAT_OT_FUNCTION, modelDisplayName, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
   b64url, utf8, sha256Hex, hmacSha256Hex,
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
   // 26.11.200 sm4-gcm transport encryption
