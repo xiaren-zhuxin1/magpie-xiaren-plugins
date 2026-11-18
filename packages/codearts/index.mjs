@@ -1,4 +1,4 @@
-﻿// CodeArts (华为云码道 代码智能体) as a magpie / OpenCode provider plugin.
+// CodeArts (华为云码道 代码智能体) as a magpie / OpenCode provider plugin.
 //
 // CodeArts, Huawei Cloud's coding agent (码道), serves its models over an
 // OpenAI-compatible Chat Completions API at
@@ -512,7 +512,7 @@ function modelDisplayName(modelId, state) {
 
 /**
  * The KERNEL's own version, the string it puts in User-Agent
- * (`opencode/126.11.2-20261117200150`). The IDE's product.json names a different
+ * (`opencode/126.11.2-20260101000000`). The IDE's product.json names a different
  * one (26.11.200), so this is a separate fact: the kernel build the IDE keeps as
  * `~/.codeartsdoer/CodeArts_Agent/AgentKernel_<ide>_<ver>-<build>.exe`. ""
  * when it cannot be read, and then no User-Agent is invented.
@@ -1446,7 +1446,7 @@ async function accountSessionIds(cred, conversation = "") {
   return { sessionId: accountSessionId, accountSessionId }
 }
 
-// The kernel's own session ids look like `ses_e796967fdffeMR60pwgrOkSRUX`: a
+// The kernel's own session ids look like `ses_1a2b3c4d5e6f7g8h9i0j1k2l`: a
 // `ses_` prefix and 24 base62 characters (measured, [header-debug] full
 // headers). A 32-hex id is a giveaway that no CodeArts client made the request,
 // so ids are shaped the same way here; the value still comes from the account's
@@ -1462,7 +1462,7 @@ function sessionIdFromDigest(digestHex) {
   return SESSION_ID_PREFIX + out
 }
 
-// The kernel's message ids look like `msg_1ec5a468a001o6Q2CZS3rvziGT`: `msg_`,
+// The kernel's message ids look like `msg_1a2b3c4d5e6fAbCdEfGhIjKlMn`: `msg_`,
 // twelve lowercase hex, then fourteen base62 — 26 characters after the prefix
 // (measured on eight ids). The counter those first characters encode is not ours
 // to reproduce; only the shape is, and a 32-hex id would stand out.

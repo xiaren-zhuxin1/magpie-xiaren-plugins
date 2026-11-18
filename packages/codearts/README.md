@@ -383,7 +383,7 @@ when `MAGPIE_CODEARTS_IDE_DIR` is set. On startup the plugin logs the resolved v
 
 | Env var | Default | What it does |
 |---|---|---|
-| `MAGPIE_CODEARTS_IDE_DIR` | _(unset)_ | Install root of the CodeArts Agent IDE. Only when set is `plugin-version` read from that IDE's `huaweicloud.authentication` extension `package.json` (exact id or `<id>.*`/`<id>-*` folder, under `resources/app/extensions/` or `extensions/`). Example: `D:\CodeArts Agent`. Unlike the sign-in state database, this root cannot be derived reliably, so it must be given explicitly. |
+| `MAGPIE_CODEARTS_IDE_DIR` | _(unset)_ | Install root of the CodeArts Agent IDE. Only when set is `plugin-version` read from that IDE's `huaweicloud.authentication` extension `package.json` (exact id or `<id>.*`/`<id>-*` folder, under `resources/app/extensions/` or `extensions/`). Example: `C:\Program Files\CodeArts Agent`. Unlike the sign-in state database, this root cannot be derived reliably, so it must be given explicitly. |
 | `MAGPIE_CODEARTS_PLUGIN_NAME` | `snap_AIIDE` | Override the `plugin-name` sent on the authorize URL. |
 | `MAGPIE_CODEARTS_PLUGIN_VERSION` | from the IDE when `MAGPIE_CODEARTS_IDE_DIR` is set, else `5.2.0` | Override the `plugin-version`. |
 | `MAGPIE_CODEARTS_THEME` | `2` | Override `theme` (`activeColorTheme.kind`: 1 = Light, 2 = Dark). The plugin does **not** read the host's current theme; use this to match a Light-theme IDE. |
@@ -502,7 +502,7 @@ measurements and code of [HuHong-Tao](https://github.com/yuweihao17/codearts/pul
   有没有重启）。老 `officeace-auth` 记录同样只按自己的链续期。两个 magpie 进程同时续期同一个账号仍可能撞车，
   输的一方重试，只有 token 一直是被消费状态才标记需重新登录。
   另外，`officeace-auth` 与本包不能同时服务 `officeace` 这个 provider id，magpie 会让你选一个，装之前先卸掉旧的。
-- **登录指纹跟随本机 IDE**：OAuth 授权 URL 上的 `plugin-name`/`plugin-version`/`theme` 是客户端身份指纹。真实 IDE 不写死版本——它发的是认证扩展自己 `package.json` 的版本；写死（如 5.2.0）会在 IDE 升级后过时。**三项里只有 `plugin-version` 会从 IDE 读取**，`plugin-name`/`theme` 固定为 `snap_AIIDE`/`2`（可用环境变量覆盖；插件不读取宿主当前主题）。取值顺序：① 对应环境变量；② **仅 `plugin-version`**，且**仅在设置 `MAGPIE_CODEARTS_IDE_DIR` 时**才从本机 IDE 的 `huaweicloud.authentication` 扩展 `package.json` 读；③ 历史兜底值。默认不扫描磁盘——把 `MAGPIE_CODEARTS_IDE_DIR` 指向 IDE 安装根目录（含 `resources` 的那层，例如 `D:\CodeArts Agent`）才会启用版本自动读取，跟随 IDE 升级。与登录状态数据库不同，安装根目录无法可靠推导，必须手动指定。解析结果（值+来源）会在启动时写进 `service: codearts` 日志，便于自查；结果按进程缓存，IDE 升级或改环境变量需重启生效。可用 `MAGPIE_CODEARTS_PLUGIN_NAME`、`MAGPIE_CODEARTS_PLUGIN_VERSION`、`MAGPIE_CODEARTS_THEME`（1=浅色，2=深色）单独覆盖任一项。
+- **登录指纹跟随本机 IDE**：OAuth 授权 URL 上的 `plugin-name`/`plugin-version`/`theme` 是客户端身份指纹。真实 IDE 不写死版本——它发的是认证扩展自己 `package.json` 的版本；写死（如 5.2.0）会在 IDE 升级后过时。**三项里只有 `plugin-version` 会从 IDE 读取**，`plugin-name`/`theme` 固定为 `snap_AIIDE`/`2`（可用环境变量覆盖；插件不读取宿主当前主题）。取值顺序：① 对应环境变量；② **仅 `plugin-version`**，且**仅在设置 `MAGPIE_CODEARTS_IDE_DIR` 时**才从本机 IDE 的 `huaweicloud.authentication` 扩展 `package.json` 读；③ 历史兜底值。默认不扫描磁盘——把 `MAGPIE_CODEARTS_IDE_DIR` 指向 IDE 安装根目录（含 `resources` 的那层，例如 `C:\Program Files\CodeArts Agent`）才会启用版本自动读取，跟随 IDE 升级。与登录状态数据库不同，安装根目录无法可靠推导，必须手动指定。解析结果（值+来源）会在启动时写进 `service: codearts` 日志，便于自查；结果按进程缓存，IDE 升级或改环境变量需重启生效。可用 `MAGPIE_CODEARTS_PLUGIN_NAME`、`MAGPIE_CODEARTS_PLUGIN_VERSION`、`MAGPIE_CODEARTS_THEME`（1=浅色，2=深色）单独覆盖任一项。
 - **致谢**：原作者 [yuweihao17](https://github.com/yuweihao17/codearts)；HuHong-Tao、ReachForStar 的
   实测与实现；CodeArts 渠道的原作者 [iJetLi](https://gitee.com/iJetLi)（[deepseek-harness-codearts](https://gitee.com/iJetLi/deepseek-harness-codearts)），
   以及转载它的 [Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)。
