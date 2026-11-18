@@ -4992,14 +4992,21 @@ test("a sealed chat decrypts as it streams, and the ciphertext never reaches the
       key = crypto.createHash("sha256").update(shared).digest().subarray(0, 16)
       return new Response(JSON.stringify({ serverPublicKey: ecdh.getPublicKey().toString("base64"), keyId, expiresIn: 3600 }), { status: 200, headers: { "content-type": "application/json" } })
     }
-    // sealed SSE: each line is iv:tag:ciphertext
+    // sealed SSE: each wire line is iv:tag:ciphertext, and what it opens to is a
+    // WHOLE SSE line — the server encrypts the `data: ` prefix too (measured).
     const aadPrefix = String(keyId)
     const mk = (obj, i) => {
       const aad = Buffer.from(`${aadPrefix}|${i}`, "utf8")
-      const { ciphertext, iv, authTag } = x.sm4GcmSeal(key, Buffer.from(JSON.stringify(obj), "utf8"), aad)
-      return `data: ${iv.toString("base64")}:${authTag.toString("base64")}:${ciphertext.toString("base64")}`
+      const line = `data:${JSON.stringify(obj)}`
+      const { ciphertext, iv, authTag } = x.sm4GcmSeal(key, Buffer.from(line, "utf8"), aad)
+      return `${iv.toString("base64")}:${authTag.toString("base64")}:${ciphertext.toString("base64")}`
     }
-    const sse = [mk({ choices: [{ delta: { content: "hi" } }] }, 0), mk({ choices: [{ delta: {}, finish_reason: "stop" }] }, 1), "data: [DONE]", ""].join("\n\n")
+    const sse = [
+      mk({ choices: [{ delta: { content: "hi" } }] }, 0),
+      mk({ choices: [{ delta: {}, finish_reason: "stop" }] }, 1),
+      mk("[DONE]", 2),
+      "",
+    ].join("\n\n")
     return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream", "X-Encrypt-Algo": x.SM4_ALGO, "X-Encrypt-Key-Id": keyId } })
   }
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, sm4: true })

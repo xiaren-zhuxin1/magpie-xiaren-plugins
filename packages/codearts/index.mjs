@@ -934,17 +934,18 @@ function decryptSealedResponse(res, sealInfo) {
     },
   })
   const chunkText = (line, i) => {
-    // `data: ` prefixes and [DONE] pass as they are; only ciphertext lines open.
-    const m = /^data:\s*(.*)$/s.exec(line)
-    const payload = m ? m[1].trim() : line.trim()
-    if (!payload || payload === "[DONE]") return line
-    const parts = payload.split(":")
+    // A sealed line is `iv:tag:ciphertext` (base64). What it opens to is a WHOLE
+    // SSE line — the server encrypts the `data: ` prefix too (measured: every
+    // chunk decrypted to `data:{…}`, the last one to `data:[DONE]`) — so the
+    // plaintext is passed through as it came, never re-prefixed. A line that is
+    // not three base64 fields was never sealed and passes untouched.
+    const parts = line.trim().split(":")
     if (parts.length !== 3) return line
     const iv = Buffer.from(parts[0], "base64")
     const tag = Buffer.from(parts[1], "base64")
     const ct = Buffer.from(parts[2], "base64")
     const plain = sm4GcmOpen(key, iv, ct, tag, Buffer.from(`${aadPrefix}|${i}`, "utf8"))
-    return `data: ${plain.toString("utf8")}`
+    return plain.toString("utf8")
   }
   const headers = new Headers(res.headers)
   headers.delete("X-Encrypt-Algo")
@@ -2490,11 +2491,19 @@ async function signedFetch(cred, input, init, context) {
           },
           aadPrefix: String(keyInfo.keyId),
         }
-      } catch {
+        if (!context.sm4.reported) {
+          context.sm4.reported = true
+          context.log?.(`CodeArts: chat body sealed (sm4-gcm, keyId ${keyInfo.keyId}, ${body.length} -> ${outBody.length} bytes)`)
+        }
+      } catch (err) {
         // Negotiation unavailable: plaintext, as the real client falls back.
         outBody = body
         outContentType = undefined
         sealInfo = null
+        if (!context.sm4.reported) {
+          context.sm4.reported = true
+          context.log?.(`CodeArts: sm4 sealing unavailable, sending plaintext (${err?.message ?? err})`)
+        }
       }
     }
     const signed = await signFor(active, method, url, outBody, extra, outContentType)
@@ -3817,6 +3826,11 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   const keyNegotiator = typeof options?.keyNegotiator === "object" && options.keyNegotiator
     ? options.keyNegotiator
     : createKeyNegotiator()
+  // Said once per process, whichever way it goes: whether chats really go out
+  // sealed, and when sealing was not available, why. Without it a silent
+  // plaintext fallback looks exactly like success. One object, shared by every
+  // loader this process runs.
+  const sm4Context = { enabled: sm4Enabled, negotiator: keyNegotiator, reported: false }
 
   // Per account, shared by every loader this process runs for it and by
   // nothing else: the gate; its free models today (null until its
@@ -4193,7 +4207,8 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           thinking,
           // SM4-GCM sealing of the chat body (26.11.200), with one negotiator
           // for every account: keys are cached per base URL.
-          sm4: { enabled: sm4Enabled, negotiator: keyNegotiator },
+          sm4: sm4Context,
+          log,
           renewCredential,
           signInDead: () => signInDead,
         }
