@@ -5105,7 +5105,7 @@ test("chat carries x-message-id equal to user-msg-id, and an encoded model-name 
   const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
   await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
   const h = seen[0]
-  assert.match(h.get("x-message-id"), /^[0-9a-f]{32}$/)
+  assert.match(h.get("x-message-id"), /^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
   assert.equal(h.get("x-message-id"), h.get("user-msg-id"))
   assert.equal(h.get("model-name"), encodeURIComponent("GLM-5.2"))
 })
@@ -5168,4 +5168,13 @@ test("model-name uses the account's own display name when its list carries one",
   // unknown id or no list: nothing invented
   assert.equal(x.modelDisplayName("unknown", state), "")
   assert.equal(x.modelDisplayName("deepseek-v4.1-flash-1017", {}), "")
+})
+test("user-msg-id takes the kernel's shape: msg_, 12 hex, 14 base62", () => {
+  for (let i = 0; i < 5; i++) {
+    const id = x.newMessageId()
+    assert.match(id, /^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
+    assert.equal(id.length, 30)
+  }
+  // and both headers carry the same id
+  assert.equal(typeof x.newMessageId, "function")
 })

@@ -1462,6 +1462,18 @@ function sessionIdFromDigest(digestHex) {
   return SESSION_ID_PREFIX + out
 }
 
+// The kernel's message ids look like `msg_1ec5a468a001o6Q2CZS3rvziGT`: `msg_`,
+// twelve lowercase hex, then fourteen base62 — 26 characters after the prefix
+// (measured on eight ids). The counter those first characters encode is not ours
+// to reproduce; only the shape is, and a 32-hex id would stand out.
+function newMessageId() {
+  const bytes = randomBytes(20)
+  let out = "msg_"
+  for (let i = 0; i < 6; i++) out += bytes[i].toString(16).padStart(2, "0")
+  for (let i = 6; i < 20; i++) out += SESSION_ID_ALPHABET[bytes[i] % 62]
+  return out
+}
+
 /**
  * The upstream session id a (account, slot) pair names. Synchronous on purpose:
  * the pool hands a slot over while a request is being built, and every request
@@ -2602,7 +2614,7 @@ async function signedFetch(cred, input, init, context) {
       // with none, the id is the honest stand-in.
       headers.set("model-name", encodeURIComponent(modelDisplayName(model, context.state) || model))
     }
-    const messageId = randomHex(16)
+    const messageId = newMessageId()
     headers.set("user-msg-id", messageId)
     headers.set("x-message-id", messageId)
     headers.set("created-time", new Date().toISOString().replace(/\.\d{3}Z$/, "Z"))
@@ -4540,7 +4552,7 @@ export const _internal = {
   b64url, utf8, sha256Hex, hmacSha256Hex,
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
   // 26.11.200 sm4-gcm transport encryption
-  sm4GcmSeal, sm4GcmOpen, createKeyNegotiator, isSealedChatUrl, exchangeSessionKey, sessionIdFromDigest, SESSION_ID_PREFIX,
+  sm4GcmSeal, sm4GcmOpen, createKeyNegotiator, isSealedChatUrl, exchangeSessionKey, sessionIdFromDigest, SESSION_ID_PREFIX, newMessageId,
   decryptSealedResponse, KEY_EXCHANGE_PATH, SM4_ALGO,
   buildCanonicalRequest, signRequestHuawei,
   credentialFromTokenResponse, credentialOf, expiresFromCredential, accountIdentityOf, accountSessionIds,
