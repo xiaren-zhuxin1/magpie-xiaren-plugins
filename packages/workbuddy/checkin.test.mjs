@@ -48,7 +48,7 @@ test("China asks the activity status, then claims through /v2", async () => {
   expect(c.init.body).toBe("{}")
   expect(c.headers.get("authorization")).toBe("Bearer at")
   expect(c.headers.get("x-user-id")).toBe("u")
-  expect(c.headers.get("user-agent")).toBe("WorkBuddy/5.9.3")
+  expect(c.headers.get("user-agent")).toBe(`WorkBuddy/${_internal.SITES.workbuddy.app}`)
 })
 
 test("the activity status already claimed is done without another claim", async () => {

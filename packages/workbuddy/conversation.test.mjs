@@ -1,4 +1,4 @@
-// One user send is one request to WorkBuddy's backend, whatever it takes:
+﻿// One user send is one request to WorkBuddy's backend, whatever it takes:
 // every step of it — a tool result sent back, a retry — carries the same
 // X-Conversation-Request-ID, and the user's next
 // message carries another. A conversation's turns share its
@@ -118,12 +118,12 @@ test("WorkBuddy AI takes the ids too, with its client's headers", async () => {
   expect(turn(ai)).toMatch(HEX32)
   expect(conv(ai)).toMatch(HEX32)
   expect(ai.get("x-ide-name")).toBe("WorkBuddy")
-  expect(ai.get("user-agent")).toBe("WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0")
+  expect(ai.get("user-agent")).toBe(`WorkBuddy/${_internal.SITES["workbuddy-ai"].app} ${_internal.SITES["workbuddy-ai"].appName}/${_internal.SITES["workbuddy-ai"].app} CLI/${_internal.SITES["workbuddy-ai"].cli}`)
 })
 
 // What WorkBuddy's desktop CLI sends with a chat, read from each build's
-// current app (5.9.3 with CLI 2.165.0 on both):
-// UserAgentHttpInterceptor's User-Agent, the app's version as the IDE's, X-Agent-Type on both builds, 5.9's X-Agent-Runtime, and the
+// current app (SITES' app and cli, both builds the same build):
+// UserAgentHttpInterceptor's User-Agent, the app's version as the IDE's, X-Agent-Type on both builds, the CLI's X-Agent-Runtime, and the
 // OpenAI SDK's headers its fetch passes on.
 test("each build's chat carries its desktop client's headers", async () => {
   const sdk = {
@@ -136,9 +136,11 @@ test("each build's chat carries its desktop client's headers", async () => {
     "x-stainless-retry-count": "0",
     "x-stainless-timeout": "1200",
   }
+  const cn = _internal.SITES.workbuddy
+  const ai = _internal.SITES["workbuddy-ai"]
   const want = {
-    workbuddy: [WorkBuddyAuthPlugin, { ...sdk, "user-agent": "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0", "x-ide-version": "5.9.3", "x-agent-runtime": "local-agent" }],
-    "workbuddy-ai": [WorkBuddyAIAuthPlugin, { ...sdk, "user-agent": "WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0", "x-ide-version": "5.9.3", "x-agent-runtime": "local-agent" }],
+    workbuddy: [WorkBuddyAuthPlugin, { ...sdk, "user-agent": `WorkBuddy/${cn.app} ${cn.appName}/${cn.app} CLI/${cn.cli}`, "x-ide-version": cn.app, "x-agent-runtime": "local-agent", "x-private-data": "false" }],
+    "workbuddy-ai": [WorkBuddyAIAuthPlugin, { ...sdk, "user-agent": `WorkBuddy/${ai.app} ${ai.appName}/${ai.app} CLI/${ai.cli}`, "x-ide-version": ai.app, "x-agent-runtime": "local-agent", "x-private-data": "false" }],
   }
   for (const [provider, [plugin, heads]] of Object.entries(want)) {
     const h = await ask(send("hi"), { provider, plugin, headers: { "x-agent-runtime": "cloud-agent" } })

@@ -165,10 +165,13 @@ estimate.
 Each chat carries WorkBuddy's headers:
 - `Authorization`, `X-User-Id`, `X-Domain`, `X-Product: SaaS`, `X-IDE-Type: WorkBuddy`;
 - the desktop CLI's `User-Agent`, `WorkBuddy/<app> <appName>/<app> CLI/<cli>`:
-  `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0` on the China build and
-  `WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0` on WorkBuddy AI, each
-  build's current app on 2026-10-29; `X-IDE-Version` is the app's version.
+  `WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0` on the China build and
+  `WorkBuddy/5.11.3 workbuddy-ai/5.11.3 CLI/2.176.0` on WorkBuddy AI (the
+  installed app, read 2026-11-18); `X-IDE-Version` is the app's version.
   A User-Agent not starting `WorkBuddy/<version>` is answered error 10085;
+- `X-Private-Data`: the CLI's model-optimization switch — `false` on a personal
+  account, where optimization is on by default, and `true` for an enterprise
+  one;
 - the client's, which WorkBuddy's usage list shows as the client that asked
   (使用端): `X-Agent-Purpose: conversation`, `X-IDE-Name: WorkBuddy`,
   `X-IDE-Version`, `X-Agent-Intent: craft`, `X-Requested-With`. Both builds
@@ -191,6 +194,14 @@ Each chat carries WorkBuddy's headers:
   `Accept: application/json`, and the `X-Stainless-*` headers of the OpenAI
   SDK it sends through (openai 6.25.0 on Electron 37's Node v22.21.1, a
   1200s timeout, no retries).
+
+Both versions above move with each WorkBuddy update. Rather than editing this
+file, point `MAGPIE_WORKBUDDY_DIR` at the installed app and they are read from
+it — `resources/install-manifest.json` (`appVersion`) and
+`resources/app.asar.unpacked/cli/package.json` (`version`). `MAGPIE_WORKBUDDY_APP_VERSION`
+and `MAGPIE_WORKBUDDY_CLI_VERSION` override either one outright, and
+`MAGPIE_WORKBUDDY_PRIVATE_DATA` sets `X-Private-Data` for an enterprise account
+(whose client sends `true`). Unset, the values measured here answer.
 
 Not sent: `X-Device-Token`, which the desktop app gets from Tencent's
 native device SDK before each prompt, and a `traceparent`, which the CLI

@@ -65,6 +65,62 @@ const AI_MODELS = [
   ["minimax-m3", "MiniMax-M3", 512000],
 ]
 
+// The desktop build and the @genie/agent-cli it bundles. Both move with every
+// update, so MAGPIE_WORKBUDDY_DIR can point at the installed app — then the
+// versions come from resources/install-manifest.json's appVersion and
+// resources/app.asar.unpacked/cli/package.json's version, and follow an upgrade
+// without editing this file. Either can also be overridden outright. The
+// constants are the last measured values (WorkBuddy 5.11.3, CLI 2.176.0 on
+// 2026-11-18, whose runtime User-Agent reads
+// `WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`) and answer when nothing is
+// configured, which keeps a test or a host without the app deterministic.
+const WORKBUDDY_DIR_ENV = "MAGPIE_WORKBUDDY_DIR"
+const WORKBUDDY_APP_VERSION = "5.11.3"
+const WORKBUDDY_CLI_VERSION = "2.176.0"
+
+const readPackageJson = (file) => {
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8"))
+    return parsed !== null && typeof parsed === "object" ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// Where the app is, when someone says so: MAGPIE_WORKBUDDY_DIR (for example
+// "D:\\WorkBuddy"). Unset means the constants answer instead.
+const workbuddyDir = () => String(process.env[WORKBUDDY_DIR_ENV] ?? "").trim()
+
+/** The app's own version, from the manifest its installer left; "" when unread. */
+function installedAppVersion(dir) {
+  if (!dir) return ""
+  return String(readPackageJson(join(dir, "resources", "install-manifest.json"))?.appVersion ?? "").trim()
+}
+
+/** The bundled CLI's version, from the package it ships; "" when unread. */
+function installedCliVersion(dir) {
+  if (!dir) return ""
+  return String(readPackageJson(join(dir, "resources", "app.asar.unpacked", "cli", "package.json"))?.version ?? "").trim()
+}
+
+// Reading the installed app is opt-in: MAGPIE_WORKBUDDY_DIR names it, and then
+// both versions follow that app instead of the constants. Unset, the constants
+// answer — so a test or a host without the app is deterministic, and an upgrade
+// is picked up by setting the variable rather than by editing this file.
+const appVersion = () => process.env.MAGPIE_WORKBUDDY_APP_VERSION?.trim() || installedAppVersion(workbuddyDir()) || WORKBUDDY_APP_VERSION
+const cliVersion = () => process.env.MAGPIE_WORKBUDDY_CLI_VERSION?.trim() || installedCliVersion(workbuddyDir()) || WORKBUDDY_CLI_VERSION
+
+// The CLI's chat sets X-Private-Data from its model-optimization switch: it is
+// "false" when resolveModelOptimizationEnabled() is true, which is
+// `!enterprise && (productDefault ?? true)` — on a personal account, on by
+// default. So "false" is what a personal account's client sends; an enterprise
+// one would send "true". MAGPIE_WORKBUDDY_PRIVATE_DATA overrides either way.
+const PRIVATE_DATA_ENV = "MAGPIE_WORKBUDDY_PRIVATE_DATA"
+function privateDataFlag() {
+  const v = String(process.env[PRIVATE_DATA_ENV] ?? "").trim().toLowerCase()
+  return v === "true" || v === "false" ? v : "false"
+}
+
 const SITES = {
   workbuddy: {
     id: "workbuddy",
@@ -75,10 +131,10 @@ const SITES = {
     ai: false,
     // the desktop app the requests are WorkBuddy's own client's of: its
     // version, its bundled CLI's (@genie/agent-cli), and the CLI's
-    // product.json applicationName. Read from WorkBuddy 5.9.3.42398134,
-    // the update feed's current build on 2026-10-28.
-    app: "5.9.3",
-    cli: "2.165.0",
+    // product.json applicationName. Read from the installed desktop app; see
+    // appVersion()/cliVersion() above.
+    app: appVersion(),
+    cli: cliVersion(),
     appName: "WorkBuddy",
     // 5.9's CLI says on each chat where the agent runs; the desktop's own
     // is "local-agent" (X-Agent-Runtime, absent in 5.8)
@@ -97,13 +153,12 @@ const SITES = {
     authID: "workbuddy-desktop-ai",
     platform: "workbuddy-ai",
     ai: true,
-    // WorkBuddy AI 5.9.3.42398134, its update feed's current build on
-    // 2026-10-29 (see the China build's): the same CLI as the China
-    // build's 5.9.3, byte for byte but for product.json, and the same
-    // Electron (37.10.3); its desktop puts agentRuntime local-agent in the
-    // prompt meta as the China build's does
-    app: "5.9.3",
-    cli: "2.165.0",
+    // WorkBuddy AI: the same desktop build and the same bundled CLI as the
+    // China build (byte for byte but for product.json, and the same Electron);
+    // its desktop puts agentRuntime local-agent in the prompt meta as the China
+    // build's does. Read from the installed desktop app; see appVersion().
+    app: appVersion(),
+    cli: cliVersion(),
     appName: "workbuddy-ai",
     runtime: "local-agent",
     keys: "https://www.workbuddy.ai/profile/keys",
@@ -407,6 +462,9 @@ function sign(site, a, headers) {
   headers.set("X-Agent-Purpose", "conversation")
   headers.set("X-IDE-Name", "WorkBuddy")
   headers.set("X-IDE-Version", site.app)
+  // The CLI's chat carries this too: "false" while model optimization is on,
+  // which is the default on a personal account (see privateDataFlag).
+  headers.set("X-Private-Data", privateDataFlag())
   for (const [k, v] of Object.entries(enterpriseHeaders(a))) headers.set(k, v)
 }
 
