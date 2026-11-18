@@ -1,4 +1,4 @@
-// Unit tests for the CodeArts OAuth plugin. Run with: bun test (node --test
+﻿// Unit tests for the CodeArts OAuth plugin. Run with: bun test (node --test
 // runs them too).
 //
 // These tests exercise the pieces magpie calls (_internal helpers) and the
@@ -493,10 +493,10 @@ test("accountSessionIds is stable per account and differs between accounts", asy
   const a = await x.accountSessionIds({ session_id: "s1", access_key_id: "AK1" })
   assert.deepEqual(await x.accountSessionIds({ session_id: "s1", access_key_id: "AK2" }), a)
   assert.notDeepEqual(await x.accountSessionIds({ session_id: "s2", access_key_id: "AK1" }), a)
-  assert.match(a.sessionId, /^[0-9a-f]{32}$/)
+  assert.match(a.sessionId, /^ses_[A-Za-z0-9]{24}$/)
   // Since 0.3.25 the account id is `accountSessionId`; `chatId` is gone (one
   // conversation gets its own session from the pool instead).
-  assert.match(a.accountSessionId, /^[0-9a-f]{32}$/)
+  assert.match(a.accountSessionId, /^ses_[A-Za-z0-9]{24}$/)
   assert.equal(a.chatId, undefined)
 })
 
@@ -993,7 +993,7 @@ test("loader signs each chat request with SDK-HMAC-SHA256 and sends it metered",
   assert.equal(headers.has("lang"), false)
   assert.equal(headers.has("chat-id"), false)
   assert.equal(headers.has("session-id"), false)
-  assert.match(headers.get("x-ot-session-id"), /^[0-9a-f]{32}$/)
+  assert.match(headers.get("x-ot-session-id"), /^ses_[A-Za-z0-9]{24}$/)
   assert.equal(headers.has("maas_type"), false)
   // The body signed and sent: bare model, explicit thinking, streamed.
   assert.deepEqual(JSON.parse(new TextDecoder().decode(seen[0].init.body)), {
@@ -1022,7 +1022,7 @@ test("sessions key on x-ot-session-id; no Chat-Id/Session-Id is sent (0.3.25)", 
   await (await b.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
   // Every request carries an x-ot-session-id and never the removed headers.
   for (const h of seen) {
-    assert.match(h.get("x-ot-session-id"), /^[0-9a-f]{32}$/)
+    assert.match(h.get("x-ot-session-id"), /^ses_[A-Za-z0-9]{24}$/)
     assert.equal(h.has("chat-id"), false)
     assert.equal(h.has("session-id"), false)
   }
@@ -1365,7 +1365,7 @@ test("every chat carries the agent's session headers: one session, a fresh trace
   await (await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
   await (await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
   const [a, b] = seen
-  assert.match(a.get("x-ot-session-id"), /^[0-9a-f]{32}$/)
+  assert.match(a.get("x-ot-session-id"), /^ses_[A-Za-z0-9]{24}$/)
   assert.equal(a.get("x-ot-session-id"), b.get("x-ot-session-id"))
   assert.equal(a.get("user-session-id"), a.get("x-ot-session-id"))
   assert.notEqual(a.get("x-ot-trace-id"), b.get("x-ot-trace-id"))
@@ -5108,4 +5108,38 @@ test("chat carries x-message-id equal to user-msg-id, and an encoded model-name 
   assert.match(h.get("x-message-id"), /^[0-9a-f]{32}$/)
   assert.equal(h.get("x-message-id"), h.get("user-msg-id"))
   assert.equal(h.get("model-name"), encodeURIComponent("GLM-5.2"))
+})
+test("chat carries the kernel's remaining identity headers (X-Encrypt-Capable, session affinity, UA)", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push({ url: String(url), headers: new Headers(init.headers) })
+    return sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, sm4: true })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  // sm4 is on, so the first request is the key exchange; the chat is the one after it
+  const h = seen.find((s) => s.url.includes("/chat/completions")).headers
+  // the capability the real kernel announces whenever sm4 is on
+  assert.equal(h.get("X-Encrypt-Capable"), x.SM4_ALGO)
+  // session affinity repeats the session id; the request says it carries a user message
+  assert.equal(h.get("x-session-affinity"), h.get("x-ot-session-id"))
+  assert.equal(h.get("x-session-user-message"), "true")
+  // its own User-Agent names the kernel build, never a browser's
+  const ua = h.get("User-Agent")
+  assert.ok(ua === null || /^opencode\/\d+\.\d+\.\d+-\d{14}$/.test(ua), `unexpected UA: ${ua}`)
+})
+
+test("kernelVersion reads the build from the kernel file name, else says nothing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codearts-kernel-"))
+  try {
+    fs.writeFileSync(path.join(dir, "AgentKernel_Vscode_26_11_200_126_11_2-20261117200150.exe"), "")
+    assert.equal(x.kernelVersion({ env: {}, root: dir }), "126.11.2-20261117200150")
+    // nothing to read: no invented version
+    assert.equal(x.kernelVersion({ env: {}, root: path.join(dir, "missing") }), "")
+    // an explicit override wins
+    assert.equal(x.kernelVersion({ env: { MAGPIE_CODEARTS_KERNEL_VERSION: "9.9.9-20990101000000" } }), "9.9.9-20990101000000")
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

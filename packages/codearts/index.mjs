@@ -497,6 +497,48 @@ function clientVersion(options = {}) {
 }
 
 /**
+ * The KERNEL's own version, the string it puts in User-Agent
+ * (`opencode/126.11.2-20261117200150`). The IDE's product.json names a different
+ * one (26.11.200), so this is a separate fact: the kernel build the IDE keeps as
+ * `~/.codeartsdoer/CodeArts_Agent/AgentKernel_<ide>_<ver>-<build>.exe`. ""
+ * when it cannot be read, and then no User-Agent is invented.
+ */
+const KERNEL_VERSION_ENV = "MAGPIE_CODEARTS_KERNEL_VERSION"
+let _kernelVersion
+function kernelVersion(options = {}) {
+  if (_kernelVersion !== undefined && !options.env && !options.root) return _kernelVersion
+  const env = options.env ?? process.env
+  const override = firstOf(env?.[KERNEL_VERSION_ENV])
+  if (override) {
+    if (!options.env && !options.root) _kernelVersion = override
+    return override
+  }
+  const root = firstOf(options.root, path.join(os.homedir(), ".codeartsdoer", "CodeArts_Agent"))
+  let best = ""
+  let bestAt = -1
+  try {
+    for (const name of fs.readdirSync(root)) {
+      const m = /^AgentKernel_.*_(\d+_\d+_\d+-\d{14})\.exe$/i.exec(name)
+      if (!m) continue
+      let at = 0
+      try {
+        at = fs.statSync(path.join(root, name)).mtimeMs
+      } catch {
+        /* unreadable entry: skip */
+      }
+      if (at > bestAt) {
+        bestAt = at
+        best = m[1].replace(/^(\d+)_(\d+)_(\d+)-/, "$1.$2.$3-")
+      }
+    }
+  } catch {
+    /* no kernel directory */
+  }
+  if (!options.env && !options.root) _kernelVersion = best
+  return best
+}
+
+/**
  * This host's private IPv4, the shape the real kernel reports (`10.1.1.147`).
  * "" when the host has none, or when the user turned it off with
  * `MAGPIE_CODEARTS_CLIENT_IP=off` — through a proxy the address the kernel would
@@ -1382,12 +1424,28 @@ async function refreshCredential(cred, fetcher) {
 async function accountSessionIds(cred, conversation = "") {
   const accountSeed = firstOf(cred.session_id, accountIdentityOf(cred).id, cred.access_key_id)
   const digest = await sha256Hex(utf8(`codearts-session:${accountSeed}`))
-  const accountSessionId = digest.slice(0, 32)
+  const accountSessionId = sessionIdFromDigest(digest)
   if (!conversation) return { sessionId: accountSessionId, accountSessionId, poolKey: accountSessionId, slot: -1 }
   // The pool key and slot come from the caller's own state (see sessionPool
   // below); here only the id for a given (account, slot) is derived, so the
   // same slot always names the same upstream session within an account.
   return { sessionId: accountSessionId, accountSessionId }
+}
+
+// The kernel's own session ids look like `ses_e796967fdffeMR60pwgrOkSRUX`: a
+// `ses_` prefix and 24 base62 characters (measured, [header-debug] full
+// headers). A 32-hex id is a giveaway that no CodeArts client made the request,
+// so ids are shaped the same way here; the value still comes from the account's
+// own digest, so one account keeps one id.
+const SESSION_ID_PREFIX = "ses_"
+const SESSION_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+/** A digest's bytes as the kernel writes a session id: `ses_` + 24 base62. */
+function sessionIdFromDigest(digestHex) {
+  const bytes = Buffer.from(String(digestHex).slice(0, 48), "hex")
+  let out = ""
+  for (let i = 0; i < 24 && i < bytes.length; i++) out += SESSION_ID_ALPHABET[bytes[i] % 62]
+  return SESSION_ID_PREFIX + out
 }
 
 /**
@@ -1396,7 +1454,8 @@ async function accountSessionIds(cred, conversation = "") {
  * of one slot must name the same session for the gateway to count it as one.
  */
 function derivedSessionId(accountSessionId, slot) {
-  return createHash("sha256").update(`codearts-slot:${accountSessionId}:${slot}`).digest("hex").slice(0, 32)
+  const digest = createHash("sha256").update(`codearts-slot:${accountSessionId}:${slot}`).digest("hex")
+  return sessionIdFromDigest(digest)
 }
 
 /**
@@ -2527,6 +2586,15 @@ async function signedFetch(cred, input, init, context) {
     headers.set("created-time", new Date().toISOString().replace(/\.\d{3}Z$/, "Z"))
     const ip = clientIp()
     if (ip) headers.set("client-ip", ip)
+    // The rest of the kernel's chat identity (measured [header-debug] full
+    // headers, 2026-11-18): the capability it announces, the session affinity
+    // it forwards, the flag that this request carries a user message, and its
+    // own User-Agent — `opencode/<kernel build>`, not a browser's.
+    if (context.sm4?.enabled) headers.set("X-Encrypt-Capable", SM4_ALGO)
+    headers.set("x-session-affinity", sessionId)
+    headers.set("x-session-user-message", "true")
+    const kernel = kernelVersion()
+    if (kernel) headers.set("User-Agent", `opencode/${kernel}`)
   }
   const send = async () => {
     // 26.11.200 seals the chat body: negotiate an SM4 key, seal the JSON, send
@@ -4437,11 +4505,11 @@ export const _internal = {
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, upstreamModelId, formatCredit,
   DEFAULT_LOCALE, LOCALE_ENV, codeartsLocale,
   CLIENT_TYPE, CLIENT_PLUGIN_NAME, CLIENT_IDE_NAME, CLIENT_VERSION_FALLBACK, CLIENT_VERSION_ENV,
-  CLIENT_IP_ENV, clientVersion, clientIp, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
+  CLIENT_IP_ENV, clientVersion, clientIp, kernelVersion, KERNEL_VERSION_ENV, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
   b64url, utf8, sha256Hex, hmacSha256Hex,
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
   // 26.11.200 sm4-gcm transport encryption
-  sm4GcmSeal, sm4GcmOpen, createKeyNegotiator, isSealedChatUrl, exchangeSessionKey,
+  sm4GcmSeal, sm4GcmOpen, createKeyNegotiator, isSealedChatUrl, exchangeSessionKey, sessionIdFromDigest, SESSION_ID_PREFIX,
   decryptSealedResponse, KEY_EXCHANGE_PATH, SM4_ALGO,
   buildCanonicalRequest, signRequestHuawei,
   credentialFromTokenResponse, credentialOf, expiresFromCredential, accountIdentityOf, accountSessionIds,
