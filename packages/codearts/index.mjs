@@ -45,6 +45,7 @@
 
 import { createHash, createHmac } from "node:crypto"
 import { createServer } from "node:http"
+import { createRequire } from "node:module"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -136,7 +137,7 @@ const MAIN_AGENT_ORIGINAL_IDS = ["build", CODE_AGENT_ID]
 const MAIN_AGENT_FALLBACK_ID = "a8bcb36232554267a5142361cc25a393"
 // Agents tried for a model list before giving up.
 const AGENT_DETAIL_TRIES = 3
-const AGENT_CENTER_HEADERS = { "Content-Type": "application/json", "Agent-Type": "AgentCenter", "X-Language": "zh-cn" }
+const AGENT_CENTER_HEADERS = { "Content-Type": "application/json", "Agent-Type": "AgentCenter" }
 // How long check-in credits last when the claim names no date of its own. The
 // vendor's date wins: today's check-ins answer one about a day on (#982).
 const CHECKIN_CREDIT_DAYS = 30
@@ -165,7 +166,7 @@ const DAILY_CHECKIN_TITLE = /签到|每日/
 // States the IDE disables the claim button in: today's benefit is in already.
 const CLAIMED_STATUSES = ["CLAIMED", "CONFIRMED", "CONSUMED"]
 // Unsigned headers snap-access routes on (signing them breaks the signature).
-const SNAP_EXTRA_HEADERS = { "Agent-Type": "PromptCenter", "X-Language": "zh-cn" }
+const SNAP_EXTRA_HEADERS = { "Agent-Type": "PromptCenter" }
 // OAuth portal (new IAM flow, each station's `portal`) and the STS token
 // endpoint, which answers both stations' codes and refresh tokens (#1090).
 const STS_TOKEN_ENDPOINT = "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens"
@@ -175,9 +176,25 @@ const CLIENT_ID = "codearts-agent"
 const REDIRECT_PATH = "/oauth/callback"
 // What the portal expects the calling plugin to be called (reverse-engineered
 // constants — the plugin/version match the real IDE extension, not this package).
+//
+// These three are the login-time identity fingerprint. The real IDE does NOT
+// hard-code the version: huaweicloud.authentication reads it from its own
+// extension manifest (`extensions.getExtension(EXTENSION_ID).packageJSON.version`)
+// and sends `theme=window.activeColorTheme.kind`. A pinned `5.2.0` / `theme=2`
+// goes stale the moment the IDE is upgraded (measured: the shipped auth
+// extension is 5.4.2), which is itself a "not the real client" signal. So the
+// values below are only fallbacks: oauthFingerprint() prefers, in order,
+//  1. MAGPIE_CODEARTS_PLUGIN_NAME / _PLUGIN_VERSION / _THEME (explicit override),
+//  2. the matching extension's package.json under MAGPIE_CODEARTS_IDE_DIR,
+//  3. these constants.
 const LOGIN_PLUGIN_NAME = "snap_AIIDE"
-const LOGIN_PLUGIN_VERSION = "5.2.0"
-const OAUTH_THEME = "2" // activeColorTheme.kind: 2 = Dark
+const LOGIN_PLUGIN_VERSION = "5.2.0" // fallback only — see oauthFingerprint()
+const OAUTH_THEME = "2" // activeColorTheme.kind: 2 = Dark; fallback only
+
+// The extension id whose package.json carries the real client's version. See
+// oauthFingerprint() below (placed after the helpers it uses).
+const AUTH_EXTENSION_ID = "huaweicloud.authentication"
+const LOGIN_VERSION_KEY = "version"
 
 const GRANT_AUTHORIZATION_CODE = "authorization_code"
 const GRANT_REFRESH_TOKEN = "refresh_token"
@@ -204,6 +221,11 @@ const SESSION_LIMIT_ERROR = "TM.00001041"
 // a request without it is a session of its own, held for about a minute, so
 // three requests in a minute used to fill the account.
 const SESSION_HEADER = "x-ot-session-id"
+// magpie's chat.headers hands the host's conversation id to the loader on this
+// header; signedFetch turns it into the upstream session id and removes it, so
+// it never reaches CodeArts. One conversation = one upstream session, the way
+// the real kernel works (`x-ot-session-id` = the conversation id, measured).
+const CONVERSATION_HEADER = "x-magpie-conversation-id"
 // A gateway that queues the request answers 429 with `queue-status: queued`
 // and a `trace-id`; the agent polls this until the trace is `promoted`, then
 // sends the request again, and DELETEs it when it gives up.
@@ -215,7 +237,30 @@ const FALLBACK_HEADER = "x-magpie-fallback"
 // what keeps the account within the vendor's 3 sessions: an option may only
 // lower it.
 const ACCOUNT_MAX_INFLIGHT = 3
+// The client identity the real kernel puts on every inferhub chat request
+// (measured: kernel [header-debug] full headers, 2026-11-17). These are the
+// headers that say "this is the official IDE plugin", not just "a signed
+// request": without them a caller is signed but anonymous. They are unsigned —
+// set after signFor(), so they change no signature. The version follows the
+// IDE: read from the installed one when available, else this snapshot.
+const CLIENT_TYPE = "IDE"
+const CLIENT_PLUGIN_NAME = "codemate_vscode"
+const CLIENT_IDE_NAME = "VSCode"
+const CLIENT_VERSION_FALLBACK = "26.11.100"
+// The IDE version this client claims. MAGPIE_CODEARTS_CLIENT_VERSION overrides
+// it; otherwise the installed CodeArts Agent's own product.json wins, so an
+// upgraded IDE does not leave the plugin claiming an old build.
+const CLIENT_VERSION_ENV = "MAGPIE_CODEARTS_CLIENT_VERSION"
+// `MAGPIE_CODEARTS_CLIENT_IP=off` leaves `client-ip` off. Through a proxy the
+// address this host sees and the one the request leaves from differ, and a
+// header naming one while the other is used contradicts what the kernel sends.
+const CLIENT_IP_ENV = "MAGPIE_CODEARTS_CLIENT_IP"
 const SESSION_RETRY_DELAYS_MS = [2_000, 4_000, 6_000, 8_000, 10_000] // the last repeats
+// How long a conversation keeps its upstream session while idle. The gateway
+// holds a finished session for about a minute, so a slot is only handed over
+// once its conversation has been quiet longer than that: a conversation that
+// comes back inside the window is the same session, not a second one.
+const SESSION_IDLE_MS = 90_000
 const SESSION_RETRY_BUDGET_MS = 150_000
 // A body nobody drains must not hold an in-flight permit forever.
 const PERMIT_MAX_HOLD_MS = 15 * 60 * 1000
@@ -342,6 +387,14 @@ const TEXT_ONLY = { input: { text: true, image: false, audio: false, video: fals
 
 const firstOf = (...vs) => vs.find((v) => typeof v === "string" && v.trim())?.trim() ?? ""
 
+// Every snap-access chain sends one X-Language: the IDE's language, not the
+// site's (measured on the real CodeArts Agent kernel — a Chinese IDE sends
+// zh-cn on both mainland and international stations). Single source, one
+// default, one env override for a non-Chinese IDE.
+const DEFAULT_LOCALE = "zh-cn"
+const LOCALE_ENV = "MAGPIE_CODEARTS_LOCALE"
+const codeartsLocale = (env = process.env) => firstOf(env?.[LOCALE_ENV]) || DEFAULT_LOCALE
+
 const asRecord = (v) => (typeof v === "object" && v !== null && !Array.isArray(v) ? v : {})
 
 function safeJson(text) {
@@ -351,6 +404,127 @@ function safeJson(text) {
   } catch {
     return null
   }
+}
+
+/**
+ * The login-time fingerprint sent to the portal. Resolved once and cached:
+ * each field takes env override > the installed IDE's auth-extension manifest
+ * (version only) > the historical fallback. Placed here, after firstOf/safeJson,
+ * so those helpers are initialised before it can run. `env` and `ideDir` are
+ * injectable so tests stay off the host's filesystem and the process env.
+ */
+let _oauthFingerprint
+function oauthFingerprint(options = {}) {
+  if (_oauthFingerprint && !options.env && !options.ideDir) return _oauthFingerprint
+  const env = options.env ?? process.env
+  const log = typeof options.log === "function" ? options.log : () => {}
+  const readVersion = () => {
+    const override = firstOf(env?.MAGPIE_CODEARTS_PLUGIN_VERSION)
+    if (override) return { version: override, source: "env MAGPIE_CODEARTS_PLUGIN_VERSION" }
+    const root = firstOf(options.ideDir, env?.MAGPIE_CODEARTS_IDE_DIR)
+    if (!root) return {}
+    // VS Code-family installs name built-in extension folders by id, but a
+    // user-installed one is `<publisher>.<name>-<version>`. Match both, and try
+    // Resources/Resources casing for case-sensitive APFS. Read-only.
+    const segments = [
+      ["resources", "app", "extensions"],
+      ["Resources", "app", "extensions"],
+      ["extensions"],
+    ]
+    for (const seg of segments) {
+      let dirs = []
+      try {
+        dirs = fs.readdirSync(path.join(root, ...seg))
+      } catch {}
+      const exact = dirs.find((d) => d === AUTH_EXTENSION_ID)
+      const prefixed = dirs.find((d) => d.startsWith(AUTH_EXTENSION_ID + ".") || d.startsWith(AUTH_EXTENSION_ID + "-"))
+      for (const d of [exact, prefixed].filter(Boolean)) {
+        try {
+          const json = safeJson(fs.readFileSync(path.join(root, ...seg, d, "package.json"), "utf8"))
+          const version = firstOf(json?.[LOGIN_VERSION_KEY])
+          if (version) return { version, source: `IDE extension ${path.join(seg.join("/"), d)}/package.json` }
+        } catch {}
+      }
+    }
+    return {}
+  }
+  const found = readVersion()
+  const fp = {
+    pluginName: firstOf(env?.MAGPIE_CODEARTS_PLUGIN_NAME, LOGIN_PLUGIN_NAME),
+    pluginVersion: found.version || LOGIN_PLUGIN_VERSION,
+    theme: firstOf(env?.MAGPIE_CODEARTS_THEME, OAUTH_THEME),
+  }
+  // The fingerprint is the whole point of this change: say where it came from,
+  // once, so a mis-set MAGPIE_CODEARTS_IDE_DIR (silent fallback) is visible.
+  log(`CodeArts login fingerprint: plugin-name=${fp.pluginName}, plugin-version=${fp.pluginVersion} (${found.source || "fallback"}), theme=${fp.theme}`)
+  if (!options.env && !options.ideDir) _oauthFingerprint = fp
+  return fp
+}
+
+/**
+ * The IDE version the chat client claims (the real kernel's `plugin-version`
+ * and `ide-version` are both the IDE build, e.g. 26.11.100). Order: env
+ * override > the installed CodeArts Agent's product.json > the snapshot below.
+ * Cached for the life of the process, like the login fingerprint.
+ */
+let _clientVersion
+function clientVersion(options = {}) {
+  if (_clientVersion && !options.env && !options.ideDir) return _clientVersion
+  const env = options.env ?? process.env
+  const log = typeof options.log === "function" ? options.log : () => {}
+  const override = firstOf(env?.[CLIENT_VERSION_ENV])
+  let version = override
+  let source = override ? `env ${CLIENT_VERSION_ENV}` : ""
+  if (!version) {
+    const root = firstOf(options.ideDir, env?.MAGPIE_CODEARTS_IDE_DIR)
+    if (root) {
+      try {
+        const json = safeJson(fs.readFileSync(path.join(root, "resources", "app", "product.json"), "utf8"))
+        const v = firstOf(json?.version)
+        if (v) {
+          version = v
+          source = "IDE product.json"
+        }
+      } catch {
+        /* no readable IDE there */
+      }
+    }
+  }
+  const resolved = version || CLIENT_VERSION_FALLBACK
+  log(`CodeArts chat client: plugin-name=${CLIENT_PLUGIN_NAME}, plugin-version=${resolved} (${source || "fallback"}), ide-name=${CLIENT_IDE_NAME}`)
+  if (!options.env && !options.ideDir) _clientVersion = resolved
+  return resolved
+}
+
+/**
+ * This host's private IPv4, the shape the real kernel reports (`10.1.1.147`).
+ * "" when the host has none, or when the user turned it off with
+ * `MAGPIE_CODEARTS_CLIENT_IP=off` — through a proxy the address the kernel would
+ * report and the address the request leaves from differ, and saying one while
+ * the other is used is a worse signal than saying neither.
+ *
+ * Only a found address is remembered: an empty answer is looked up again next
+ * time, so a network that comes up (or a VPN that reconnects) is picked up
+ * rather than leaving the header missing for the life of the process.
+ */
+let _clientIp
+function clientIp(env = process.env) {
+  if (firstOf(env?.[CLIENT_IP_ENV]).toLowerCase() === "off") return ""
+  if (_clientIp) return _clientIp
+  try {
+    for (const list of Object.values(os.networkInterfaces() ?? {})) {
+      for (const a of list ?? []) {
+        if (a?.family !== "IPv4" || a.internal) continue
+        if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address)) {
+          _clientIp = a.address
+          return _clientIp
+        }
+      }
+    }
+  } catch {
+    /* no interfaces to read */
+  }
+  return ""
 }
 
 function num(v) {
@@ -507,6 +681,278 @@ async function signDpopJws(keyPair, htm, htu) {
   return `${signingInput}.${b64url(new Uint8Array(sig))}`
 }
 
+// ---- SM4-GCM transport encryption (the 26.11.200 client's `sm4-gcm`) --------
+//
+// Since CodeArts Agent 26.11.200 the kernel encrypts the /api/v2/chat/completions
+// request body with SM4-GCM and asks for an encrypted SSE answer back (measured:
+// "Transport security hook enabled sm4=true", path list ["/api/v2/chat/completions"]).
+// Node's OpenSSL build has no sm4-gcm cipher (only sm4 / sm4-cbc / sm4-ctr / …), so
+// GCM is built here from the SM4 block cipher: CTR mode for the keystream plus
+// GHASH for the tag, which is exactly the GCM definition. Verified against NIST's
+// AES-GCM vectors (framework) and Node's sm4-ctr keystream (block cipher).
+
+let _nodeCrypto
+function nodeCrypto() {
+  if (_nodeCrypto !== undefined) return _nodeCrypto
+  try {
+    // Bun and Node both expose node:crypto synchronously.
+    _nodeCrypto = globalThis.process?.versions?.node || typeof Bun !== "undefined" ? createRequire(import.meta.url)("node:crypto") : null
+  } catch {
+    _nodeCrypto = null
+  }
+  return _nodeCrypto
+}
+
+// createRequire reaches node:crypto synchronously (SM4/GCM and ECDH are not in
+// WebCrypto); kept lazy so a host without it still loads the plugin, and only
+// sealing then reports that SM4 is unsupported.
+
+const SM4_BLOCK = 16
+const GCM_R = 0xe1000000000000000000000000000000n
+const MASK128 = (1n << 128n) - 1n
+
+const bytesToBig = (b) => b.reduce((acc, x) => (acc << 8n) | BigInt(x), 0n)
+function bigToBytes(n) {
+  const out = Buffer.alloc(SM4_BLOCK)
+  for (let i = SM4_BLOCK - 1; i >= 0; i--) {
+    out[i] = Number(n & 0xffn)
+    n >>= 8n
+  }
+  return out
+}
+
+/** GF(2^128) multiplication as GCM defines it (right shift, reduce by R). */
+function gfMul128(x, y) {
+  let z = 0n
+  let v = y
+  for (let i = 0; i < 128; i++) {
+    if ((x >> BigInt(127 - i)) & 1n) z ^= v
+    const lsb = v & 1n
+    v >>= 1n
+    if (lsb) v ^= GCM_R
+  }
+  return z & MASK128
+}
+
+/** GHASH: AAD then ciphertext then the bit-length block, all in H. */
+function ghash(H, aad, ciphertext) {
+  let y = 0n
+  const feed = (buf) => {
+    for (let i = 0; i < buf.length; i += SM4_BLOCK) {
+      const padded = Buffer.alloc(SM4_BLOCK)
+      buf.subarray(i, i + SM4_BLOCK).copy(padded)
+      y = gfMul128(y ^ bytesToBig(padded), H)
+    }
+  }
+  feed(aad)
+  feed(ciphertext)
+  const len = Buffer.alloc(SM4_BLOCK)
+  len.writeBigUInt64BE(BigInt(aad.length * 8), 0)
+  len.writeBigUInt64BE(BigInt(ciphertext.length * 8), 8)
+  return bigToBytes(gfMul128(y ^ bytesToBig(len), H))
+}
+
+/** One SM4 block encrypt (ECB, no padding) — the GCM building block. */
+function sm4BlockEncrypt(crypto, key, block) {
+  const c = crypto.createCipheriv("sm4-ecb", key, null)
+  c.setAutoPadding(false)
+  return Buffer.concat([c.update(block), c.final()])
+}
+
+/** A fresh 12-byte GCM IV, the length the client uses. */
+function sm4GcmIv() {
+  const crypto = nodeCrypto()
+  return Buffer.from(crypto.randomBytes(12))
+}
+
+/**
+ * SM4-GCM seal: returns { ciphertext, iv, authTag }. `aad` is authenticated but
+ * sent beside the ciphertext (the client's `${method}|${path}|${timestamp}`).
+ */
+function sm4GcmSeal(key, plaintext, aad, iv = sm4GcmIv()) {
+  const crypto = nodeCrypto()
+  if (!crypto) throw new Error("CodeArts: node:crypto is required for sm4-gcm")
+  if (iv.length !== 12) throw new Error(`CodeArts: GCM iv must be 12 bytes, got ${iv.length}`)
+  const H = bytesToBig(sm4BlockEncrypt(crypto, key, Buffer.alloc(SM4_BLOCK)))
+  const J0 = Buffer.concat([iv, Buffer.from([0, 0, 0, 1])])
+  const counter = Buffer.from(J0)
+  const inc32 = () => {
+    const n = counter.readUInt32BE(12)
+    counter.writeUInt32BE((n + 1) >>> 0, 12)
+  }
+  const ct = Buffer.alloc(plaintext.length)
+  let pos = 0
+  while (pos < plaintext.length) {
+    inc32()
+    const ks = sm4BlockEncrypt(crypto, key, counter)
+    for (let i = 0; i < SM4_BLOCK && pos < plaintext.length; i++, pos++) ct[pos] = plaintext[pos] ^ ks[i]
+  }
+  const S = ghash(H, aad, ct)
+  const ekj0 = sm4BlockEncrypt(crypto, key, J0)
+  const authTag = Buffer.alloc(SM4_BLOCK)
+  for (let i = 0; i < SM4_BLOCK; i++) authTag[i] = S[i] ^ ekj0[i]
+  return { ciphertext: ct, iv: Buffer.from(iv), authTag }
+}
+
+/** SM4-GCM open; throws when the tag does not verify (a tampered answer). */
+function sm4GcmOpen(key, iv, ciphertext, authTag, aad) {
+  const crypto = nodeCrypto()
+  if (!crypto) throw new Error("CodeArts: node:crypto is required for sm4-gcm")
+  if (iv.length !== 12) throw new Error(`CodeArts: GCM iv must be 12 bytes, got ${iv.length}`)
+  const H = bytesToBig(sm4BlockEncrypt(crypto, key, Buffer.alloc(SM4_BLOCK)))
+  const S = ghash(H, aad, ciphertext)
+  const J0 = Buffer.concat([iv, Buffer.from([0, 0, 0, 1])])
+  const ekj0 = sm4BlockEncrypt(crypto, key, J0)
+  const want = Buffer.alloc(SM4_BLOCK)
+  for (let i = 0; i < SM4_BLOCK; i++) want[i] = S[i] ^ ekj0[i]
+  if (!crypto.timingSafeEqual(want, Buffer.from(authTag))) throw new Error("CodeArts: sm4-gcm tag mismatch")
+  const counter = Buffer.from(J0)
+  const out = Buffer.alloc(ciphertext.length)
+  let pos = 0
+  while (pos < ciphertext.length) {
+    const n = counter.readUInt32BE(12)
+    counter.writeUInt32BE((n + 1) >>> 0, 12)
+    const ks = sm4BlockEncrypt(crypto, key, counter)
+    for (let i = 0; i < SM4_BLOCK && pos < ciphertext.length; i++, pos++) out[pos] = ciphertext[pos] ^ ks[i]
+  }
+  return out
+}
+
+// ---- session-key negotiation (ECDH P-256 → SM4 key) ------------------------
+
+const KEY_EXCHANGE_PATH = "/api/v1/security/key-exchange"
+const SM4_ALGO = "sm4-gcm"
+/** Reuse a key until this close to its stated expiry, as the client does. */
+const KEY_EARLY_MS = 300_000
+
+/**
+ * One account's channel to the key-exchange endpoint: an ECDH key pair per
+ * negotiation, the shared secret's SHA-256 head as the SM4 key. Keys are cached
+ * per base URL and re-negotiated when they near expiry or a request says the
+ * key id is gone. `getKey(baseUrl, signFn, fetchFn)` returns { key, keyId }.
+ */
+function createKeyNegotiator(crypto = nodeCrypto()) {
+  const cached = new Map()
+  return {
+    async getKey(baseUrl, exchange) {
+      const hit = cached.get(baseUrl)
+      if (hit && Date.now() < hit.expiresAt - KEY_EARLY_MS) return hit
+      const ecdh = crypto.createECDH("prime256v1")
+      ecdh.generateKeys()
+      const clientPublicKey = ecdh.getPublicKey().toString("base64")
+      const sessionId = crypto.randomBytes(16).toString("hex")
+      const timestamp = Date.now()
+      const res = await exchange({ clientPublicKey, sessionId, timestamp })
+      if (!res?.serverPublicKey || !res?.keyId) throw new Error("CodeArts: key exchange answered without serverPublicKey/keyId")
+      const shared = ecdh.computeSecret(Buffer.from(res.serverPublicKey, "base64"))
+      const key = crypto.createHash("sha256").update(shared).digest().subarray(0, 16)
+      const ttl = Number(res.expiresIn)
+      const entry = {
+        key,
+        keyId: String(res.keyId),
+        expiresAt: Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 3_600_000),
+      }
+      cached.set(baseUrl, entry)
+      return entry
+    },
+    forget(baseUrl, keyId) {
+      const hit = cached.get(baseUrl)
+      if (hit && (!keyId || hit.keyId === keyId)) cached.delete(baseUrl)
+    },
+  }
+}
+
+/**
+ * Is this the encrypted chat endpoint, and are we asked to encrypt? Only
+ * /api/v2/chat/completions is sealed; every other signed call stays plaintext.
+ */
+function isSealedChatUrl(url, sm4) {
+  if (!sm4?.enabled) return false
+  try {
+    const u = new URL(String(url))
+    return u.pathname.startsWith("/api/v2/chat/completions")
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One key-exchange POST: `{clientPublicKey, sessionId, timestamp}` answered with
+ * `{serverPublicKey, keyId, expiresIn}`. Signed like the other snap calls (the
+ * client sends either AKSK or an x-auth-token; here the account's credentials).
+ */
+async function exchangeSessionKey(base, payload, cred, fetcher) {
+  const url = new URL(KEY_EXCHANGE_PATH, base).href
+  const body = utf8(JSON.stringify(payload))
+  const headers = await signFor(cred, "POST", url, body)
+  const res = await fetcher(url, { method: "POST", headers, body, redirect: "error" })
+  if (!res.ok) throw new Error(`CodeArts: key exchange failed (HTTP ${res.status})`)
+  return await res.json()
+}
+
+/**
+ * A sealed answer: every SSE line past the first carries `iv|tag|ciphertext`
+ * (base64, split on ':') with AAD `${keyId}|${chunkIndex}`. Rebuilt as a plain
+ * SSE stream so all the ordinary parsing above it keeps working.
+ */
+function decryptSealedResponse(res, sealInfo) {
+  if (!res?.body) return res
+  // The client decides by the answer, not by having sent a sealed body: only a
+  // response whose own X-Encrypt-Algo says sm4-gcm is decrypted; anything else
+  // (a gateway that answered plaintext anyway) passes straight through.
+  if (String(res.headers?.get("X-Encrypt-Algo") ?? "").toLowerCase() !== SM4_ALGO) return res
+  const key = sealInfo.key
+  const aadPrefix = sealInfo.aadPrefix ?? sealInfo.keyId
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let buffer = ""
+  let index = 0
+  const body = new ReadableStream({
+    async start(controller) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) {
+            if (buffer.trim()) controller.enqueue(encoder.encode(chunkText(buffer.trim(), index)))
+            controller.close()
+            return
+          }
+          buffer += decoder.decode(value, { stream: true })
+          let at
+          while ((at = buffer.indexOf("\n\n")) !== -1) {
+            const line = buffer.slice(0, at).trim()
+            buffer = buffer.slice(at + 2)
+            if (!line) continue
+            controller.enqueue(encoder.encode(chunkText(line, index) + "\n\n"))
+            index += 1
+          }
+        }
+      } catch (err) {
+        controller.error(err)
+      }
+    },
+  })
+  const chunkText = (line, i) => {
+    // `data: ` prefixes and [DONE] pass as they are; only ciphertext lines open.
+    const m = /^data:\s*(.*)$/s.exec(line)
+    const payload = m ? m[1].trim() : line.trim()
+    if (!payload || payload === "[DONE]") return line
+    const parts = payload.split(":")
+    if (parts.length !== 3) return line
+    const iv = Buffer.from(parts[0], "base64")
+    const tag = Buffer.from(parts[1], "base64")
+    const ct = Buffer.from(parts[2], "base64")
+    const plain = sm4GcmOpen(key, iv, ct, tag, Buffer.from(`${aadPrefix}|${i}`, "utf8"))
+    return `data: ${plain.toString("utf8")}`
+  }
+  const headers = new Headers(res.headers)
+  headers.delete("X-Encrypt-Algo")
+  headers.delete("X-Encrypt-Key-Id")
+  headers.set("Content-Type", "text/event-stream")
+  return new Response(body, { status: res.status, statusText: res.statusText, headers })
+}
+
 // ---- Huawei SDK-HMAC-SHA256 request signing --------------------------------
 
 function buildCanonicalRequest(method, uri, query, headers, payloadHash) {
@@ -532,7 +978,7 @@ function canonicalQuery(url) {
  * Extra headers (e.g. `maas_type: benefit`) participate in the canonical
  * request and must be sent verbatim, or the server rejects the signature.
  */
-async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, extraHeaders, dateStampOverride) {
+async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, extraHeaders, dateStampOverride, contentType) {
   const url = new URL(urlStr)
   let uri = url.pathname
   if (!uri.endsWith("/")) uri += "/"
@@ -549,7 +995,9 @@ async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, ex
   if (extraHeaders !== undefined) {
     for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v)
   }
-  if (method.toUpperCase() !== "GET") headers.set("content-type", "application/json")
+  // A sealed (sm4-gcm) body is sent as application/octet-stream and signed as
+  // such, exactly as the client re-signs after encrypting; a plain call keeps JSON.
+  if (method.toUpperCase() !== "GET") headers.set("content-type", contentType || "application/json")
 
   const signedHeaders = [...headers.keys()].sort()
   const canonicalRequest = buildCanonicalRequest(method.toUpperCase(), uri, query, headers, payloadHash)
@@ -847,15 +1295,94 @@ async function refreshCredential(cred, fetcher) {
 }
 
 /**
- * The account's upstream session headers, the same in every process and across
- * refreshes: a fresh Chat-Id per request opened a new session each time and
- * pinned the 3-session cap. Credentials from before `session_id` existed fall
- * back to the signer's identity, then to the access key.
+ * The account's upstream session id. The real kernel sends its conversation id
+ * there (`x-ot-session-id: ses_…`, measured), so one conversation is one
+ * upstream session — that is what the vendor's 3-session allowance is spent on.
+ *
+ * With a conversation id (`conversation`), the session follows it: each
+ * conversation gets its own, stable across that conversation's requests. The
+ * vendor holds a finished session for about a minute, and its cap of three is
+ * per account, so an account may not open a fourth id just because a fourth
+ * conversation started: the account keeps a fixed pool of at most three ids and
+ * a conversation takes one of them (least recently used is handed on). A
+ * conversation that comes back after its slot was handed on gets a slot again,
+ * never a fourth id. Without a conversation (models lists, usage, a caller that
+ * named none) it falls back to the account's own single id, as before.
+ * Credentials from before `session_id` existed fall back to the signer's
+ * identity, then to the access key.
  */
-async function accountSessionIds(cred) {
-  const seed = firstOf(cred.session_id, accountIdentityOf(cred).id, cred.access_key_id)
-  const digest = await sha256Hex(utf8(`codearts-session:${seed}`))
-  return { sessionId: digest.slice(0, 32), chatId: digest.slice(32, 64) }
+async function accountSessionIds(cred, conversation = "") {
+  const accountSeed = firstOf(cred.session_id, accountIdentityOf(cred).id, cred.access_key_id)
+  const digest = await sha256Hex(utf8(`codearts-session:${accountSeed}`))
+  const accountSessionId = digest.slice(0, 32)
+  if (!conversation) return { sessionId: accountSessionId, accountSessionId, poolKey: accountSessionId, slot: -1 }
+  // The pool key and slot come from the caller's own state (see sessionPool
+  // below); here only the id for a given (account, slot) is derived, so the
+  // same slot always names the same upstream session within an account.
+  return { sessionId: accountSessionId, accountSessionId }
+}
+
+/**
+ * The upstream session id a (account, slot) pair names. Synchronous on purpose:
+ * the pool hands a slot over while a request is being built, and every request
+ * of one slot must name the same session for the gateway to count it as one.
+ */
+function derivedSessionId(accountSessionId, slot) {
+  return createHash("sha256").update(`codearts-slot:${accountSessionId}:${slot}`).digest("hex").slice(0, 32)
+}
+
+/**
+ * The account's session pool: at most `size` upstream ids, each a slot a
+ * conversation holds while it is active. Returning a conversation's slot hands
+ * it to the next conversation that needs one instead of opening a fourth id the
+ * gateway would refuse (`TM.00001041`), which the finished session's ~1 minute
+ * hold would turn into a retry storm. Least recently used goes first.
+ */
+function createSessionPool(size = ACCOUNT_MAX_INFLIGHT, now = Date.now, idleMs = SESSION_IDLE_MS) {
+  const slots = new Map() // slot index -> { id, conversation, usedAt }
+  for (let i = 0; i < size; i += 1) slots.set(i, { id: "", conversation: "", usedAt: 0 })
+  const ids = new Map() // conversation -> slot index
+  const forget = (i) => {
+    const s = slots.get(i)
+    if (s?.conversation) ids.delete(s.conversation)
+  }
+  return {
+    /** The slot index `conversation` holds, taking (or reusing) one as needed. */
+    take(conversation, deriveId) {
+      const held = ids.get(conversation)
+      if (held !== undefined) {
+        slots.get(held).usedAt = now()
+        return held
+      }
+      // A slot whose conversation went quiet for longer than the gateway keeps
+      // a finished session may be handed over; one that is merely idle (the
+      // user thinking, a tool running) keeps its id, so a conversation that
+      // comes back is the same upstream session and not a second one.
+      const t = now()
+      const stale = [...slots.entries()].filter(([, s]) => t - s.usedAt >= idleMs)
+      let free = [...slots.keys()].find((i) => !slots.get(i).conversation)
+      if (free === undefined && stale.length > 0) {
+        const lru = stale.sort((a, b) => a[1].usedAt - b[1].usedAt)[0][0]
+        forget(lru)
+        free = lru
+      }
+      if (free === undefined) {
+        // Every slot is still within the gateway's hold: reuse the least
+        // recently used anyway rather than open a fourth id, which the gateway
+        // would refuse. That conversation gets a fresh session when it returns.
+        const lru = [...slots.entries()].sort((a, b) => a[1].usedAt - b[1].usedAt)[0][0]
+        forget(lru)
+        free = lru
+      }
+      slots.set(free, { id: deriveId(free), conversation, usedAt: t })
+      ids.set(conversation, free)
+      return free
+    },
+    /** The id a slot names, "" until it was ever taken. */
+    idOf(slot) {
+      return slot >= 0 && slots.has(slot) ? slots.get(slot).id : ""
+    },
+  }
 }
 
 // ---- OAuth login: URL + loopback callback ----------------------------------
@@ -865,11 +1392,14 @@ async function accountSessionIds(cred) {
  * IDE): the station's portal authorize page, or, for a station with its own
  * login page, that page with the authorize URL as where it goes next.
  */
-function buildOAuthLoginUrl(port, pkce, ticketId, station = STATIONS.mainland) {
-  const authorize = `${station.portal}/authorize?theme=${OAUTH_THEME}&locale=${station.locale}`
+function buildOAuthLoginUrl(port, pkce, ticketId, station = STATIONS.mainland, fp = oauthFingerprint()) {
+  // fp values now come from env vars / an on-disk manifest, so encode them:
+  // a stray space, '&', '#' or non-ASCII would otherwise break the query or
+  // inject parameters. ticket_id/code_challenge are internally generated hex.
+  const authorize = `${station.portal}/authorize?theme=${encodeURIComponent(fp.theme)}&locale=${station.locale}`
     + `&uri_scheme=${CLIENT_ID}&client_id=${CLIENT_ID}&port=${port}`
     + `&code_challenge=${pkce.codeChallenge}&code_challenge_method=SHA-256`
-    + `&ticket_id=${ticketId}&plugin-name=${LOGIN_PLUGIN_NAME}&plugin-version=${LOGIN_PLUGIN_VERSION}`
+    + `&ticket_id=${ticketId}&plugin-name=${encodeURIComponent(fp.pluginName)}&plugin-version=${encodeURIComponent(fp.pluginVersion)}`
   if (!station.login) return authorize
   return `${station.login}&locale=${station.locale}&service=${encodeURIComponent(authorize)}`
 }
@@ -1812,16 +2342,21 @@ const refusalTo = (url, cred) =>
  * goes with `redirect: "error"`: a redirect would forward the security token
  * to wherever it points.
  */
-async function signFor(cred, method, url, body, extraSigned) {
+async function signFor(cred, method, url, body, extraSigned, contentType) {
   if (!isSignedHostUrl(url, cred)) throw new Error(refusalTo(url, cred))
   const signed = await signRequestHuawei(
     cred.access_key_id, cred.secret_access_key, cred.security_token,
-    method, url, body, extraSigned,
+    method, url, body, extraSigned, undefined, contentType,
   )
   const headers = new Headers()
   signed.forEach((value, key) => {
     if (key !== "host") headers.set(key, value)
   })
+  // One locale for every signed chain. Set after signRequestHuawei(), so it
+  // stays out of SignedHeaders (the gateway rejects a changed signature).
+  // It follows the IDE's language, not the station (measured on the real
+  // kernel: a Chinese IDE sends zh-cn even on the international station).
+  headers.set("X-Language", codeartsLocale())
   return headers
 }
 
@@ -1836,7 +2371,7 @@ function withSignInMark(res) {
 /**
  * The plugin's per-request fetch. A chat is reshaped (see prepareChatBody),
  * signed with the account's temporary credentials and sent under the account's
- * one Chat-Id/Session-Id, after taking one of its in-flight permits. Then:
+ * one x-ot-session-id, after taking one of its in-flight permits. Then:
  * - `TM.00001041` (a 400, or a 200's first event) is retried, re-signed, until
  *   a session frees or the budget runs out — then a 429, which magpie fails
  *   over on;
@@ -1865,6 +2400,18 @@ async function signedFetch(cred, input, init, context) {
   // magpie's own header, never CodeArts'
   const fallback = baseHeaders.get(FALLBACK_HEADER) === "1"
   baseHeaders.delete(FALLBACK_HEADER)
+  // magpie's chat.headers names the conversation this request belongs to. It
+  // becomes the upstream session id (one conversation = one session, as the
+  // real kernel does) and never reaches CodeArts itself. The id comes from the
+  // account's pool: a conversation holds one of at most three slots, so a
+  // fourth conversation cannot open a fourth upstream session.
+  const conversation = firstOf(baseHeaders.get(CONVERSATION_HEADER))
+  baseHeaders.delete(CONVERSATION_HEADER)
+  let sessionId = context.sessionId
+  if (conversation && context.sessionPool) {
+    const slot = context.sessionPool.take(conversation, (i) => derivedSessionId(context.accountSessionId, i))
+    sessionId = context.sessionPool.idOf(slot) || context.sessionId
+  }
   let body
   if (init?.body != null) body = await toBytes(init.body)
   else if (req) body = new Uint8Array(await req.clone().arrayBuffer())
@@ -1878,32 +2425,122 @@ async function signedFetch(cred, input, init, context) {
   const signal = init?.signal ?? req?.signal ?? undefined
 
   let active = cred
-  const send = async () => {
-    const signed = await signFor(active, method, url, body, extra)
-    const headers = new Headers(baseHeaders)
-    // The body may have been reshaped: the transport counts it again.
-    headers.delete("content-length")
-    signed.forEach((value, key) => headers.set(key, value))
-    headers.set("Chat-Id", context.chatId)
-    headers.set("Session-Id", context.sessionId)
-    // The session headers the CodeArts agent sends: one session per account,
-    // a fresh trace per request.
-    headers.set(SESSION_HEADER, context.sessionId)
-    headers.set("user-session-id", context.sessionId)
+  // The seal of the last send (null when plaintext); a sealed answer is already
+  // decrypted inside send(), so callers only ever see the plain Response.
+  let lastSeal = null
+  const urlBase = `${new URL(url).protocol}//${new URL(url).host}`
+  // The session/client headers the real kernel sends on every chat (measured
+  // [header-debug] full headers). Unsigned: set after signFor(), together with
+  // the X-Encrypt-* ones, so a signature covers none of them. Used both for the
+  // sealed call and for the plaintext retry after it.
+  const applyChatHeaders = (headers) => {
+    headers.set(SESSION_HEADER, sessionId)
+    headers.set("user-session-id", sessionId)
     headers.set("x-ot-parent-session-id", "")
     headers.set("x-ot-trace-id", randomHex(16))
     headers.set("x-ot-span-id", randomHex(8))
     headers.set("x-snap-traceid", randomHex(16))
-    headers.set("lang", "en")
-    return context.fetcher(url, {
+    const version = clientVersion()
+    headers.set("x-ot-client-type", CLIENT_TYPE)
+    headers.set("x-ot-client-version", version)
+    headers.set("plugin-name", CLIENT_PLUGIN_NAME)
+    headers.set("plugin-version", version)
+    headers.set("ide-name", CLIENT_IDE_NAME)
+    headers.set("ide-version", version)
+    headers.set("x-ot-function", "")
+    if (model) {
+      headers.set("model-id", model)
+      // 26.11.200 measures `model-name` as encodeURIComponent(model.name).
+      headers.set("model-name", encodeURIComponent(model))
+    }
+    const messageId = randomHex(16)
+    headers.set("user-msg-id", messageId)
+    headers.set("x-message-id", messageId)
+    headers.set("created-time", new Date().toISOString().replace(/\.\d{3}Z$/, "Z"))
+    const ip = clientIp()
+    if (ip) headers.set("client-ip", ip)
+  }
+  const send = async () => {
+    // 26.11.200 seals the chat body: negotiate an SM4 key, seal the JSON, send
+    // the ciphertext as application/octet-stream with the X-Encrypt-* headers
+    // and re-sign it (the Content-Type is part of the signature). Any failure
+    // here falls back to plaintext — the client's own fallbackOnFailure.
+    let outBody = body
+    let outContentType
+    let sealInfo = null
+    if (isSealedChatUrl(url, context.sm4) && body.length > 0) {
+      try {
+        const base = `${new URL(url).protocol}//${new URL(url).host}`
+        const keyInfo = await context.sm4.negotiator.getKey(base, (payload) => exchangeSessionKey(base, payload, active, context.fetcher))
+        const ts = Date.now()
+        const path = new URL(url).pathname
+        const aad = `${method}|${path}|${ts}`
+        const sealed = sm4GcmSeal(keyInfo.key, Buffer.from(body), Buffer.from(aad, "utf8"))
+        outBody = utf8(sealed.ciphertext.toString("base64"))
+        outContentType = "application/octet-stream"
+        sealInfo = {
+          keyId: keyInfo.keyId,
+          key: keyInfo.key,
+          headers: {
+            "X-Encrypt-Algo": SM4_ALGO,
+            "X-Encrypt-Key-Id": keyInfo.keyId,
+            "X-Encrypt-Iv": sealed.iv.toString("base64"),
+            "X-Encrypt-Tag": sealed.authTag.toString("base64"),
+            "X-Encrypt-Ts": String(ts),
+          },
+          aadPrefix: String(keyInfo.keyId),
+        }
+      } catch {
+        // Negotiation unavailable: plaintext, as the real client falls back.
+        outBody = body
+        outContentType = undefined
+        sealInfo = null
+      }
+    }
+    const signed = await signFor(active, method, url, outBody, extra, outContentType)
+    const headers = new Headers(baseHeaders)
+    // The body may have been reshaped: the transport counts it again.
+    headers.delete("content-length")
+    signed.forEach((value, key) => headers.set(key, value))
+    if (sealInfo) for (const [k, v] of Object.entries(sealInfo.headers)) headers.set(k, v)
+    applyChatHeaders(headers)
+    // X-Language is the one locale for every signed chain, injected by signFor()
+    // after signing (unsigned) — it follows the IDE's language, not the station.
+    // `lang` stays off: the real kernel's chat request sends no such header.
+    const res = await context.fetcher(url, {
       ...init,
       method,
       headers,
-      ...(body.length > 0 ? { body } : {}),
+      ...(outBody.length > 0 ? { body: outBody } : {}),
       ...(signal ? { signal } : {}),
       // After the caller's init, so no caller turns it back on.
       redirect: "error",
     })
+    // A sealed request gets a sealed answer: decrypt the SSE chunks before any
+    // caller sees them (and drop the X-Encrypt-* headers the client also drops).
+    lastSeal = sealInfo
+    // The client's own recovery: a sealed request the gateway refused (often a
+    // server-side key expiry) clears the cached key, retries once, and then
+    // gives up on sealing and sends the same body as plaintext.
+    if (sealInfo && (res.status < 200 || res.status >= 300)) {
+      void res.body?.cancel().catch(() => {})
+      context.sm4.negotiator.forget(urlBase, sealInfo.keyId)
+      const retry = await signFor(active, method, url, body, extra)
+      const plainHeaders = new Headers(baseHeaders)
+      plainHeaders.delete("content-length")
+      retry.forEach((value, key) => plainHeaders.set(key, value))
+      applyChatHeaders(plainHeaders)
+      lastSeal = null
+      return context.fetcher(url, {
+        ...init,
+        method,
+        headers: plainHeaders,
+        ...(body.length > 0 ? { body } : {}),
+        ...(signal ? { signal } : {}),
+        redirect: "error",
+      })
+    }
+    return sealInfo ? decryptSealedResponse(res, sealInfo) : res
   }
 
   // A sign-in known to be beyond renewal never reaches the network again.
@@ -3145,6 +3782,16 @@ async function renewFromIde(cred, read) {
 
 export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   const fetcher = typeof options?.fetch === "function" ? options.fetch : fetch
+  const log = (message, level = "info") => {
+    try {
+      void client?.app?.log?.({ body: { service: "codearts", level, message } })?.catch?.(() => {})
+    } catch {
+      /* no log channel */
+    }
+  }
+  // Resolve the login fingerprint now, once, so its source is visible in the
+  // host log (a mis-set MAGPIE_CODEARTS_IDE_DIR otherwise silently falls back).
+  oauthFingerprint({ log })
   // Tunables (magpie: `magpie plugin options <name> '{…}'`). `maxInflight` can
   // only lower the gate: above 3 the account would pass the vendor's cap.
   const maxInflight = Number.isInteger(options?.maxInflight) && options.maxInflight > 0
@@ -3154,10 +3801,22 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   const retryDelays = Array.isArray(options?.retryDelays) && options.retryDelays.length ? options.retryDelays : SESSION_RETRY_DELAYS_MS
   const queueBudgetMs = Number.isFinite(options?.queueBudgetMs) ? Math.max(0, options.queueBudgetMs) : QUEUE_BUDGET_MS
   const thinking = options?.thinking !== false
+  // 26.11.200 seals the chat body with SM4-GCM, and the runtime shows it is the
+  // only path the real client takes: every chat went out encrypted (no
+  // "Encrypting fetch bypass" for /api/v2/chat/completions), and the answer came
+  // back encrypted too. So this is on by default, exactly as the client does it.
+  // A failed negotiation, or a sealed call the gateway refuses, falls back to
+  // plaintext — the client's own fallbackOnFailure. `sm4: false` turns it off.
+  const sm4Enabled = options?.sm4 !== false
   const ledgerPath = typeof options?.ledgerPath === "string" && options.ledgerPath ? options.ledgerPath : defaultLedgerPath()
   // Test hooks: the clock and the sleep the retry budget runs on.
   const now = typeof options?.now === "function" ? options.now : Date.now
   const sleep = typeof options?.sleep === "function" ? options.sleep : delay
+  // One negotiator for this plugin instance: SM4 session keys are cached per
+  // snap-access base URL and shared by every account that reaches that host.
+  const keyNegotiator = typeof options?.keyNegotiator === "object" && options.keyNegotiator
+    ? options.keyNegotiator
+    : createKeyNegotiator()
 
   // Per account, shared by every loader this process runs for it and by
   // nothing else: the gate; its free models today (null until its
@@ -3170,14 +3829,17 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   const accountState = (key) => {
     if (!accounts.has(key)) {
       accounts.set(key, {
-        gate: createConcurrencyGate(maxInflight), benefit: null, regular: null, noBenefit: new Set(),
+        gate: createConcurrencyGate(maxInflight), sessionPool: createSessionPool(maxInflight), benefit: null, regular: null, noBenefit: new Set(),
         claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0,
         renewing: null, renewed: null, unconfirmed: null,
       })
     }
     return accounts.get(key)
   }
-  const stateOf = async (cred) => accountState((await accountSessionIds(cred)).sessionId)
+  const stateOf = async (cred) => {
+    const ids = await accountSessionIds(cred)
+    return accountState(ids.accountSessionId ?? ids.sessionId)
+  }
 
   // One renewal per refresh token, whoever asks for it (each of the account's
   // loaders, magpie's auth.refresh): STS spends a refresh token once, so a
@@ -3504,14 +4166,21 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           return (await renewCredential(cred)) ?? cred
         }
 
-        // One account = one upstream session and one in-flight budget.
+        // One account = one in-flight budget, however many conversations it
+        // runs: the vendor's cap of 3 sessions is per account, so the gate is
+        // keyed by the account even when each conversation has its own upstream
+        // session id.
         const ids = await accountSessionIds(cred)
-        const state = accountState(ids.sessionId)
+        const state = accountState(ids.accountSessionId ?? ids.sessionId)
         // A station without opengw has no free models: none is sent as one.
         if (!stationOf(cred).opengw && state.benefit === null) state.benefit = new Set()
         const context = {
           ...ids,
           gate: state.gate,
+          // The account's pool of at most three upstream sessions: every
+          // loader this process runs for the account shares it, so a fourth
+          // conversation cannot open a session the gateway would refuse.
+          sessionPool: state.sessionPool,
           // The account's own model lists, read at each request (the models
           // hook keeps them current).
           state,
@@ -3522,6 +4191,9 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           retryDelays,
           queueBudgetMs,
           thinking,
+          // SM4-GCM sealing of the chat body (26.11.200), with one negotiator
+          // for every account: keys are cached per base URL.
+          sm4: { enabled: sm4Enabled, negotiator: keyNegotiator },
           renewCredential,
           signInDead: () => signInDead,
         }
@@ -3613,6 +4285,19 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         return r
       },
 
+      /**
+       * Per-request header: this conversation's own upstream session. The real
+       * kernel sends its conversation id as `x-ot-session-id`, so each
+       * conversation costs one of the account's three sessions instead of the
+       * whole account opening on one id. The loader turns this mark into the
+       * session id and strips it before the request leaves.
+       */
+      "chat.headers": async (input, output) => {
+        const id = input?.model?.providerID ?? input?.provider?.info?.id
+        if (id !== PROVIDER || !input?.sessionID) return
+        output.headers[CONVERSATION_HEADER] = String(input.sessionID).slice(0, 128)
+      },
+
       // The browser sign-in first, always; the CodeArts Agent's second, only
       // while the IDE's state file is there; the international browser
       // sign-in last (the host picks a method by its place, so the older
@@ -3668,14 +4353,20 @@ export const _internal = {
   OPS_DELIVERY_URL, OPS_CLAIM_URL, OPS_CONFIRM_URL, SESSION_LIMIT_ERROR, ACCOUNT_MAX_INFLIGHT,
   STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, upstreamModelId, formatCredit,
+  DEFAULT_LOCALE, LOCALE_ENV, codeartsLocale,
+  CLIENT_TYPE, CLIENT_PLUGIN_NAME, CLIENT_IDE_NAME, CLIENT_VERSION_FALLBACK, CLIENT_VERSION_ENV,
+  CLIENT_IP_ENV, clientVersion, clientIp, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
   b64url, utf8, sha256Hex, hmacSha256Hex,
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
+  // 26.11.200 sm4-gcm transport encryption
+  sm4GcmSeal, sm4GcmOpen, createKeyNegotiator, isSealedChatUrl, exchangeSessionKey,
+  decryptSealedResponse, KEY_EXCHANGE_PATH, SM4_ALGO,
   buildCanonicalRequest, signRequestHuawei,
   credentialFromTokenResponse, credentialOf, expiresFromCredential, accountIdentityOf, accountSessionIds,
   profileOf, looksLikeIdentifier, maskPhone, fetchAccountPhone, accountPhoneField, IAM_HOST, IAM_USER_URL,
   requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
   isDeadRefreshToken, isPermanentRefreshFailure, nearExpiry, persistCredential,
-  buildOAuthLoginUrl, buildPortalLoginResultUrl,
+  buildOAuthLoginUrl, oauthFingerprint, buildPortalLoginResultUrl,
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow, isSignedHostUrl, hostOf, SIGNED_HOSTS, signFor, traceQueueCall,
   BENEFIT_CLAIM_URL, AGENT_LIST_URL, AGENT_DETAIL_URL, CODE_AGENT_ID,
   canonicalQuery, beijingDay, nextBeijingMidnight, vendorDate, creditRateOf,
@@ -4751,7 +5442,7 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
   const fetcher = typeof options?.fetch === "function" ? options.fetch : fetch
   const log = (message, level = "info") => {
     try {
-      client?.app?.log?.({ service: "officeace", level, message })
+      void client?.app?.log?.({ body: { service: "officeace", level, message } })?.catch?.(() => {})
     } catch {
       /* no log channel */
     }

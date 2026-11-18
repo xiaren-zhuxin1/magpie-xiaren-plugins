@@ -1,3 +1,41 @@
+# magpie-codearts-plugins
+
+CodeArts（华为云码道）认证 provider 插件，用于 [magpie](https://usemagpie.ai) / OpenCode。
+
+## 来源
+
+本项目从 `magpie-community/plugins` 的 `packages/codearts`（提交 `8c7e8f66`）提取，
+并包含以下经本机实践验证的改动：
+
+- **登录指纹可配置**：OAuth 授权 URL 的 `plugin-name` / `plugin-version` / `theme`
+  由写死常量改为「环境变量 → 本机 IDE 认证扩展 manifest → 兜底」三级解析，全部 URL 编码。
+  运行时抓包确认真实 IDE 发送 `plugin-name=snap_AIIDE`、`plugin-version=5.4.2`。
+- **X-Language 全局收敛**：所有 CodeArts snap-access 签名请求统一在 `signFor()` 签名后注入
+  一个 `X-Language`（默认 `zh-cn`，环境变量 `MAGPIE_CODEARTS_LOCALE` 覆盖），跟随 IDE 语言
+  而非站点。真实内核 chat 的 `[header-debug] full headers` 证实：国内/国际站中文 IDE 均为 `zh-cn`。
+- **请求头对齐真实内核**：chat 请求删除 `lang` / `Chat-Id` / `Session-Id`，会话只认 `x-ot-session-id`。
+- **工程清理**：日志形状改为仓库惯例的 `{ body: { service, level, message } }` 并补 `.catch`；
+  删除死字段 `chatId`；版本升至 0.3.24。
+
+## 验证状态
+
+- 225 个单元测试中 224 通过，1 个为 Windows 临时目录清理的已知 flaky（已用未改动的 HEAD 基线复现证明与本改动无关）。
+- 运行时实测：内核端口发现、`/v1/init` 配置、真实 OAuth authorize URL、真实 chat 请求头均已抓包确认。
+- 详见同目录或上游归档的 `CodeArts_运行时验证报告_2026-11-17.md`。
+
+## 安装（从本仓库）
+
+```sh
+magpie plugin add <本仓库路径或 clone URL>
+magpie plugin login codearts
+```
+
+## License
+
+MIT — 见 [LICENSE](LICENSE)。原作者与贡献者见 [README.md](README.md) 的 Credits 一节。
+
+---
+
 # @magpie-community/opencode-codearts-auth
 
 Signs in to **Huawei Cloud** and serves two providers in OpenCode and magpie:
@@ -155,6 +193,30 @@ rate), shown as `DeepSeek-V4.1-Flash-1017`, not folded into `DeepSeek-V4.1-Flash
   answers an image with `InferHub.001001020.406` "The request model is not multimodal". Since
   0.2.4 magpie is told so, and describes an image for the model or leaves it out. That refusal,
   inside a `200` or with any status, comes back as a `400`, not a `502` an agent would ask again.
+- Every CodeArts snap-access signed request carries one `X-Language`, set **after** signing so it never enters
+  `SignedHeaders`. Since 0.3.24 it follows the IDE's language (default `zh-cn`), not the
+  station: the real kernel sends `zh-cn` on the international station too when the IDE is in
+  Chinese. Override with `MAGPIE_CODEARTS_LOCALE` (e.g. `en-us`) for an English IDE. Chat sends
+  no `lang`, `Chat-Id` or `Session-Id`; sessions key on `x-ot-session-id` alone.
+- **The client identity** (since 0.3.25). Every chat request also carries what the real kernel
+  sends about itself, measured from its own `[header-debug] full headers` on 2026-11-17:
+  `x-ot-client-type: IDE`, `x-ot-client-version`, `plugin-name: codemate_vscode`,
+  `plugin-version`, `ide-name: VSCode`, `ide-version`, an empty `x-ot-function`, `model-id` /
+  `model-name`, a fresh `user-msg-id` and `created-time`, and the host's private IPv4 as
+  `client-ip`. All are unsigned (set after signing, like the headers above), so a signature
+  never covers them. The version is the IDE's own build: read from the installed IDE's
+  `resources/app/product.json` when `MAGPIE_CODEARTS_IDE_DIR` is set, else
+  `MAGPIE_CODEARTS_CLIENT_VERSION`, else the snapshot this release shipped with — set the env
+  var, or the plugin keeps claiming that build after an IDE upgrade.
+  `MAGPIE_CODEARTS_CLIENT_IP=off` leaves `client-ip` off (behind a proxy the address this host
+  sees is not the one the request leaves from).
+- **One conversation is one upstream session** (since 0.3.25). The real kernel sends its
+  conversation id as `x-ot-session-id`, so each conversation uses one of the account's three
+  sessions instead of the whole account sharing one id. An account keeps a pool of at most
+  three ids: a conversation keeps its own while active and for `90s` after going quiet (the
+  gateway holds a finished session for about a minute), and only then may its slot be handed
+  to another conversation — so a fourth conversation never opens a session the gateway would
+  refuse (`TM.00001041`).
 
 ## Usage and check-in
 
@@ -269,6 +331,68 @@ under **Settings → Usage → Plugins**.
 | `retryDelays` | `[2000,4000,6000,8000,10000]` | retry waits in ms (the last repeats) |
 | `queueBudgetMs` | `300000` | how long to wait in the gateway's queue |
 | `thinking` | `true` | `false` stops adding `thinking: { type: "enabled" }` |
+| `sm4` | `true` | `false` stops sealing the chat body with SM4-GCM (see below) |
+
+### SM4-GCM transport encryption (CodeArts Agent 26.11.200)
+
+Since the 26.11.200 client, the kernel encrypts its `/api/v2/chat/completions`
+body with SM4-GCM and asks for an encrypted SSE answer (measured from the
+kernel: `Transport security hook enabled sm4=true`, encrypt paths
+`["/api/v2/chat/completions"]`). Keys come from
+`POST /api/v1/security/key-exchange`: the client sends an ECDH P-256 public key
+and gets the server's back with a `keyId`; the SHA-256 head of the shared
+secret is the SM4 key. A sealed request carries `X-Encrypt-Algo: sm4-gcm`,
+`X-Encrypt-Key-Id`, `X-Encrypt-Iv`, `X-Encrypt-Tag` and `X-Encrypt-Ts`, sends
+`application/octet-stream` (the Content-Type is part of the signature, so the
+request is re-signed), and authenticates `${method}|${path}|${timestamp}` as
+AAD. Each answer chunk is `iv:tag:ciphertext` (base64) with AAD
+`${keyId}|${chunkIndex}`.
+
+It is **on by default**, because it is the only path the real client takes: a
+measured chat went out sealed and came back sealed, with no plaintext bypass for
+`/api/v2/chat/completions`. A sealed call spends one key-exchange request (cached
+for 2 hours), and a failed negotiation — or a sealed call the gateway refuses —
+falls back to plaintext automatically (the client's own `fallbackOnFailure`),
+retrying once after dropping the cached key. Only `/api/v2/chat/completions` is
+sealed and every other signed call stays plaintext. Node's OpenSSL has no
+`sm4-gcm` cipher, so GCM is built here from `sm4-ecb`/`sm4-ctr` with no
+dependency added; its GHASH is verified against NIST's AES-GCM vectors and its
+keystream against Node's `sm4-ctr`.
+
+To keep the old plaintext behaviour, set `sm4: false`:
+
+```sh
+magpie plugin options codearts '{"sm4": false}'
+```
+
+The `X-Language` header is configured by the environment variable `MAGPIE_CODEARTS_LOCALE`
+(default `zh-cn`, the IDE's language it follows), not by a plugin option.
+
+### Login fingerprint (matching the installed IDE)
+
+The portal sees `plugin-name`, `plugin-version` and `theme` on the OAuth authorize URL. The real
+IDE does not pin the version: its authentication extension reads its own `package.json` version, so
+a hard-coded one goes stale on the next upgrade and reads as "not the real client". Of the three
+values, **only `plugin-version` is read from the IDE**; `plugin-name` and `theme` are not read from
+the IDE — they are fixed (`snap_AIIDE` / `2`) unless you override them with the env vars below. The
+plugin resolves each value, in order, from (1) its env var, (2) for the version only, the installed
+IDE's `huaweicloud.authentication` extension manifest, (3) the historical fallback
+(`snap_AIIDE` / `5.2.0` / `2`). Nothing is scanned by default — version auto-discovery happens only
+when `MAGPIE_CODEARTS_IDE_DIR` is set. On startup the plugin logs the resolved value and its source
+(`service: codearts`) so a mis-set directory is visible rather than a silent fallback.
+
+| Env var | Default | What it does |
+|---|---|---|
+| `MAGPIE_CODEARTS_IDE_DIR` | _(unset)_ | Install root of the CodeArts Agent IDE. Only when set is `plugin-version` read from that IDE's `huaweicloud.authentication` extension `package.json` (exact id or `<id>.*`/`<id>-*` folder, under `resources/app/extensions/` or `extensions/`). Example: `D:\CodeArts Agent`. Unlike the sign-in state database, this root cannot be derived reliably, so it must be given explicitly. |
+| `MAGPIE_CODEARTS_PLUGIN_NAME` | `snap_AIIDE` | Override the `plugin-name` sent on the authorize URL. |
+| `MAGPIE_CODEARTS_PLUGIN_VERSION` | from the IDE when `MAGPIE_CODEARTS_IDE_DIR` is set, else `5.2.0` | Override the `plugin-version`. |
+| `MAGPIE_CODEARTS_THEME` | `2` | Override `theme` (`activeColorTheme.kind`: 1 = Light, 2 = Dark). The plugin does **not** read the host's current theme; use this to match a Light-theme IDE. |
+| `MAGPIE_CODEARTS_CLIENT_VERSION` | the IDE's `product.json` when `MAGPIE_CODEARTS_IDE_DIR` is set, else `26.11.100` | What chat claims as `plugin-version` / `ide-version`. Set it after an IDE upgrade if the IDE directory is not configured. |
+| `MAGPIE_CODEARTS_CLIENT_IP` | _(unset)_ | `off` leaves `client-ip` off — for use behind a proxy, where the address this host sees is not the one the request leaves from. |
+
+Resolution is cached for the life of the process, so an IDE upgrade or an env change takes effect
+after a restart. To confirm what is in use, sign in once and read the `service: codearts`
+`plugin-version=… (source)` line in magpie's log.
 
 ## Credits
 
@@ -331,6 +455,9 @@ measurements and code of [HuHong-Tao](https://github.com/yuweihao17/codearts/pul
   更长的（如 MCP 工具名）发出时缩为前 55 个字符 + `_` + 8 位 SHA-256，回答（流式与非流式）里的工具调用再换回原名。
   0.2.4 起所有模型都声明为只收文本（码道对图片回 `InferHub.001001020.406`「The request model is not multimodal」），
   magpie 会替模型描述图片或把图片略去；这个拒绝不论放在 200 里还是带别的状态码，都换算为 `400`，而不是让智能体反复重试的 `502`。
+- **X-Language**（0.3.24 起）：所有签名请求都带同一个 `X-Language`，在**签名之后**设置，因此不进入 `SignedHeaders`。它跟随 IDE 语言（默认 `zh-cn`），不随站点——真实内核在国际站、中文 IDE 下发的也是 `zh-cn`。英文 IDE 用环境变量 `MAGPIE_CODEARTS_LOCALE=en-us` 覆盖。对话请求不发 `lang`、`Chat-Id`、`Session-Id`，会话只认 `x-ot-session-id`。
+- **客户端身份**（0.3.25 起）：每个对话请求还带上真实内核自报的身份，取自 2026-11-17 实测的 `[header-debug] full headers`：`x-ot-client-type: IDE`、`x-ot-client-version`、`plugin-name: codemate_vscode`、`plugin-version`、`ide-name: VSCode`、`ide-version`、空值 `x-ot-function`、`model-id`/`model-name`、每请求新的 `user-msg-id` 与 `created-time`，以及本机私网 IPv4 的 `client-ip`。这些都在签名之后设置，不进入 `SignedHeaders`。版本号取自本机 IDE 的 `resources/app/product.json`（设了 `MAGPIE_CODEARTS_IDE_DIR` 时），否则 `MAGPIE_CODEARTS_CLIENT_VERSION`，再否则用本版内置的快照——**不设环境变量，IDE 升级后插件仍会自报旧版本**。`MAGPIE_CODEARTS_CLIENT_IP=off` 可关掉 `client-ip`（走代理时本机看到的地址与出口地址不一致）。
+- **一个对话一个上游会话**（0.3.25 起）：真实内核把对话 ID 放在 `x-ot-session-id`，所以每个对话各占账号三个会话额度中的一个，而不是全账号共用一个 id。账号维护至多三个 id 的池：对话活跃期间及静默 `90` 秒内保持自己的 id（网关会持有已结束的会话约一分钟），之后才可能把槽位让给别的对话——这样第 4 个对话也不会开出网关会拒绝的会话（`TM.00001041`）。
 - **用量与签到**：总积分决定账号是否可用，其余积分桶只做明细；另有每日免费额度窗口。各批积分的到期
   时间读自码道控制台同一批接口，读不到时退回插件的签到账本 `~/.config/magpie/codearts-checkins.json`
   （这部分仍在用更多账号验证，请以控制台为准）。`auth.checkin` 与客户端「限时福利 → 每日领取」一致
@@ -375,6 +502,7 @@ measurements and code of [HuHong-Tao](https://github.com/yuweihao17/codearts/pul
   有没有重启）。老 `officeace-auth` 记录同样只按自己的链续期。两个 magpie 进程同时续期同一个账号仍可能撞车，
   输的一方重试，只有 token 一直是被消费状态才标记需重新登录。
   另外，`officeace-auth` 与本包不能同时服务 `officeace` 这个 provider id，magpie 会让你选一个，装之前先卸掉旧的。
+- **登录指纹跟随本机 IDE**：OAuth 授权 URL 上的 `plugin-name`/`plugin-version`/`theme` 是客户端身份指纹。真实 IDE 不写死版本——它发的是认证扩展自己 `package.json` 的版本；写死（如 5.2.0）会在 IDE 升级后过时。**三项里只有 `plugin-version` 会从 IDE 读取**，`plugin-name`/`theme` 固定为 `snap_AIIDE`/`2`（可用环境变量覆盖；插件不读取宿主当前主题）。取值顺序：① 对应环境变量；② **仅 `plugin-version`**，且**仅在设置 `MAGPIE_CODEARTS_IDE_DIR` 时**才从本机 IDE 的 `huaweicloud.authentication` 扩展 `package.json` 读；③ 历史兜底值。默认不扫描磁盘——把 `MAGPIE_CODEARTS_IDE_DIR` 指向 IDE 安装根目录（含 `resources` 的那层，例如 `D:\CodeArts Agent`）才会启用版本自动读取，跟随 IDE 升级。与登录状态数据库不同，安装根目录无法可靠推导，必须手动指定。解析结果（值+来源）会在启动时写进 `service: codearts` 日志，便于自查；结果按进程缓存，IDE 升级或改环境变量需重启生效。可用 `MAGPIE_CODEARTS_PLUGIN_NAME`、`MAGPIE_CODEARTS_PLUGIN_VERSION`、`MAGPIE_CODEARTS_THEME`（1=浅色，2=深色）单独覆盖任一项。
 - **致谢**：原作者 [yuweihao17](https://github.com/yuweihao17/codearts)；HuHong-Tao、ReachForStar 的
   实测与实现；CodeArts 渠道的原作者 [iJetLi](https://gitee.com/iJetLi)（[deepseek-harness-codearts](https://gitee.com/iJetLi/deepseek-harness-codearts)），
   以及转载它的 [Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)。
@@ -382,3 +510,4 @@ measurements and code of [HuHong-Tao](https://github.com/yuweihao17/codearts/pul
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+

@@ -6,13 +6,22 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
+import crypto from "node:crypto"
 import fs from "node:fs"
 import http from "node:http"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 
-import { CodeArtsAuthPlugin, OfficeAceAuthPlugin, _internal as x, _officeace as oa } from "./index.mjs"
+import { CodeArtsAuthPlugin as CodeArtsAuthPluginRaw, OfficeAceAuthPlugin, _internal as x, _officeace as oa } from "./index.mjs"
+
+// SM4-GCM sealing is ON by default (the real client's only path). The great
+// majority of tests here exercise other behaviour with a stub fetch that answers
+// nothing about key exchange; with sealing on, every chat would first spend a
+// key-exchange request and shift what they observe. So the shared constructor
+// turns it OFF unless a test asks for it — and one test below pins the real
+// default by calling the raw export.
+const CodeArtsAuthPlugin = (ctx, opts = {}) => CodeArtsAuthPluginRaw(ctx, { sm4: false, ...opts })
 
 // The record-key file lives beside the check-in ledger; a test must never write
 // the real ~/.config (a fresh CI home hides this, a developer's does not).
@@ -485,7 +494,10 @@ test("accountSessionIds is stable per account and differs between accounts", asy
   assert.deepEqual(await x.accountSessionIds({ session_id: "s1", access_key_id: "AK2" }), a)
   assert.notDeepEqual(await x.accountSessionIds({ session_id: "s2", access_key_id: "AK1" }), a)
   assert.match(a.sessionId, /^[0-9a-f]{32}$/)
-  assert.match(a.chatId, /^[0-9a-f]{32}$/)
+  // Since 0.3.25 the account id is `accountSessionId`; `chatId` is gone (one
+  // conversation gets its own session from the pool instead).
+  assert.match(a.accountSessionId, /^[0-9a-f]{32}$/)
+  assert.equal(a.chatId, undefined)
 })
 
 test("createConcurrencyGate caps permits, admits in order, and honours abort", async () => {
@@ -975,9 +987,13 @@ test("loader signs each chat request with SDK-HMAC-SHA256 and sends it metered",
 
   const headers = new Headers(seen[0].init.headers)
   assert.match(headers.get("authorization"), /^SDK-HMAC-SHA256 Access=AK,/)
-  assert.equal(headers.get("lang"), "en")
-  assert.match(headers.get("chat-id"), /^[0-9a-f]{32}$/)
-  assert.match(headers.get("session-id"), /^[0-9a-f]{32}$/)
+  // 0.3.25: chat carries X-Language (the IDE's language, zh-cn by default) and
+  // no `lang`/`Chat-Id`/`Session-Id` — sessions key on x-ot-session-id alone.
+  assert.equal(headers.get("x-language"), "zh-cn")
+  assert.equal(headers.has("lang"), false)
+  assert.equal(headers.has("chat-id"), false)
+  assert.equal(headers.has("session-id"), false)
+  assert.match(headers.get("x-ot-session-id"), /^[0-9a-f]{32}$/)
   assert.equal(headers.has("maas_type"), false)
   // The body signed and sent: bare model, explicit thinking, streamed.
   assert.deepEqual(JSON.parse(new TextDecoder().decode(seen[0].init.body)), {
@@ -991,7 +1007,7 @@ test("loader signs each chat request with SDK-HMAC-SHA256 and sends it metered",
   assert.equal(json.choices[0].finish_reason, "stop")
 })
 
-test("one account keeps one Chat-Id/Session-Id across requests and loaders", async () => {
+test("sessions key on x-ot-session-id; no Chat-Id/Session-Id is sent (0.3.25)", async () => {
   const cred = await makeCred()
   const seen = []
   const fetcher = async (url, init) => {
@@ -1004,8 +1020,12 @@ test("one account keeps one Chat-Id/Session-Id across requests and loaders", asy
   await (await a.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
   await (await a.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
   await (await b.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
-  assert.equal(new Set(seen.map((h) => h.get("chat-id"))).size, 1)
-  assert.equal(new Set(seen.map((h) => h.get("session-id"))).size, 1)
+  // Every request carries an x-ot-session-id and never the removed headers.
+  for (const h of seen) {
+    assert.match(h.get("x-ot-session-id"), /^[0-9a-f]{32}$/)
+    assert.equal(h.has("chat-id"), false)
+    assert.equal(h.has("session-id"), false)
+  }
 })
 
 test("a streaming caller gets the upstream stream intact, peeked bytes included", async () => {
@@ -4930,4 +4950,155 @@ test("a mainland account's loader keeps the mainland chat base", async () => {
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => sseResponse(okStream) })
   const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
   assert.equal(loaded.baseURL, x.CHAT_API_BASE)
+})
+
+// ---- 26.11.200: sm4-gcm transport encryption --------------------------------
+
+test("sm4GcmSeal/sm4GcmOpen round-trip, and the keystream matches node's sm4-ctr", () => {
+  const key = Buffer.from("0123456789abcdeffedcba9876543210", "hex")
+  const iv = Buffer.from("000102030405060708090a0b", "hex")
+  const pt = Buffer.from("Hello CodeArts SM4-GCM payload.", "utf8")
+  const aad = Buffer.from("POST|/api/v2/chat/completions|1700000000000", "utf8")
+  const { ciphertext, authTag, iv: outIv } = x.sm4GcmSeal(key, pt, aad, iv)
+  assert.ok(outIv.equals(iv))
+  // The GCM CTR keystream starts at J0+1 = iv||00000002; node's sm4-ctr agrees.
+  const j0 = Buffer.concat([iv, Buffer.from([0, 0, 0, 1])])
+  const ctr = Buffer.from(j0)
+  ctr.writeUInt32BE((ctr.readUInt32BE(12) + 1) >>> 0, 12)
+  const c = crypto.createCipheriv("sm4-ctr", key, ctr)
+  assert.ok(Buffer.concat([c.update(pt), c.final()]).equals(ciphertext))
+  // and it opens back
+  assert.equal(x.sm4GcmOpen(key, iv, ciphertext, authTag, aad).toString("utf8"), pt.toString("utf8"))
+  // a different AAD (or a flipped tag) is refused
+  assert.throws(() => x.sm4GcmOpen(key, iv, ciphertext, authTag, Buffer.from("POST|/other|1")), /tag mismatch/)
+  const bad = Buffer.from(authTag); bad[0] ^= 1
+  assert.throws(() => x.sm4GcmOpen(key, iv, ciphertext, bad, aad), /tag mismatch/)
+})
+
+test("a sealed chat decrypts as it streams, and the ciphertext never reaches the caller", async () => {
+  // A stub gateway: answers key-exchange, then a sealed SSE answer.
+  const ecdh = crypto.createECDH("prime256v1")
+  ecdh.generateKeys()
+  const keyId = "kid-1"
+  let key
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push({ url: String(url), init })
+    if (String(url).includes(x.KEY_EXCHANGE_PATH)) {
+      // derive the same SM4 key from the client's public key
+      const body = JSON.parse(Buffer.from(init.body).toString("utf8"))
+      const clientPub = Buffer.from(body.clientPublicKey, "base64")
+      const shared = ecdh.computeSecret(clientPub)
+      key = crypto.createHash("sha256").update(shared).digest().subarray(0, 16)
+      return new Response(JSON.stringify({ serverPublicKey: ecdh.getPublicKey().toString("base64"), keyId, expiresIn: 3600 }), { status: 200, headers: { "content-type": "application/json" } })
+    }
+    // sealed SSE: each line is iv:tag:ciphertext
+    const aadPrefix = String(keyId)
+    const mk = (obj, i) => {
+      const aad = Buffer.from(`${aadPrefix}|${i}`, "utf8")
+      const { ciphertext, iv, authTag } = x.sm4GcmSeal(key, Buffer.from(JSON.stringify(obj), "utf8"), aad)
+      return `data: ${iv.toString("base64")}:${authTag.toString("base64")}:${ciphertext.toString("base64")}`
+    }
+    const sse = [mk({ choices: [{ delta: { content: "hi" } }] }, 0), mk({ choices: [{ delta: {}, finish_reason: "stop" }] }, 1), "data: [DONE]", ""].join("\n\n")
+    return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream", "X-Encrypt-Algo": x.SM4_ALGO, "X-Encrypt-Key-Id": keyId } })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, sm4: true })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  const res = await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [], stream: true }))
+  const text = await res.text()
+  assert.match(text, /"content":"hi"/, "the answer is plaintext to the caller")
+  assert.equal(res.headers.get("X-Encrypt-Algo"), null, "the encryption headers are dropped")
+  // the chat request went out sealed, with its headers
+  const chat = seen.find((s) => s.url.includes("/chat/completions"))
+  const h = new Headers(chat.init.headers)
+  assert.equal(h.get("X-Encrypt-Algo"), x.SM4_ALGO)
+  assert.equal(h.get("X-Encrypt-Key-Id"), keyId)
+  assert.equal(h.get("content-type"), "application/octet-stream")
+  assert.ok(h.get("X-Encrypt-Iv") && h.get("X-Encrypt-Tag") && h.get("X-Encrypt-Ts"))
+})
+
+test("a failed key negotiation falls back to plaintext (the client's own fallback)", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push({ url: String(url), init })
+    if (String(url).includes(x.KEY_EXCHANGE_PATH)) return new Response("nope", { status: 500 })
+    return sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, sm4: true })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  const chat = seen.find((s) => s.url.includes("/chat/completions"))
+  const h = new Headers(chat.init.headers)
+  assert.equal(h.has("X-Encrypt-Algo"), false, "plaintext when the key could not be had")
+  assert.equal(h.get("content-type"), "application/json")
+})
+
+test("sm4 sealing is the default (the real client's only path), and `sm4: false` turns it off", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push(String(url))
+    return sseResponse(okStream)
+  }
+  // No sm4 option at all: the raw export seals, so it first negotiates a key.
+  const plugin = await CodeArtsAuthPluginRaw({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  assert.equal(seen.some((u) => u.includes(x.KEY_EXCHANGE_PATH)), true, "default seals: a key is negotiated first")
+
+  const off = []
+  const offFetcher = async (url, init = {}) => {
+    off.push(String(url))
+    return sseResponse(okStream)
+  }
+  const plain = await CodeArtsAuthPluginRaw({ client: {} }, { fetch: offFetcher, sm4: false })
+  const plainLoaded = await plain.auth.loader(async () => makeAuth(await makeCred()))
+  await (await plainLoaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  assert.equal(off.some((u) => u.includes(x.KEY_EXCHANGE_PATH)), false, "sm4:false spends no key exchange")
+})
+
+test("a sealed chat the gateway refuses is retried once as plaintext, with the key cache dropped", async () => {
+  const ecdh = crypto.createECDH("prime256v1")
+  ecdh.generateKeys()
+  const keyId = "kid-expired"
+  let exchanges = 0
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    const u = String(url)
+    seen.push({ url: u, init })
+    if (u.includes(x.KEY_EXCHANGE_PATH)) {
+      exchanges += 1
+      const body = JSON.parse(Buffer.from(init.body).toString("utf8"))
+      const shared = ecdh.computeSecret(Buffer.from(body.clientPublicKey, "base64"))
+      void crypto.createHash("sha256").update(shared).digest().subarray(0, 16)
+      return new Response(JSON.stringify({ serverPublicKey: ecdh.getPublicKey().toString("base64"), keyId, expiresIn: 7200 }), { status: 200, headers: { "content-type": "application/json" } })
+    }
+    // The gateway refuses the sealed call once (like a server-side key expiry).
+    const h = new Headers(init.headers)
+    if (h.has("X-Encrypt-Algo")) return new Response("key expired", { status: 400 })
+    return sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPluginRaw({ client: {} }, { fetch: fetcher, sm4: true })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  const res = await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))
+  assert.equal(res.status, 200, "the plaintext retry succeeded")
+  const chats = seen.filter((s) => s.url.includes("/chat/completions"))
+  assert.equal(chats.length, 2, "one sealed attempt, then one plaintext retry")
+  assert.equal(new Headers(chats[0].init.headers).get("X-Encrypt-Algo"), x.SM4_ALGO)
+  assert.equal(new Headers(chats[1].init.headers).has("X-Encrypt-Algo"), false, "the retry is plaintext")
+  assert.equal(exchanges, 1, "the refused key is not negotiated again")
+})
+
+test("chat carries x-message-id equal to user-msg-id, and an encoded model-name (26.11.200)", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push(new Headers(init.headers))
+    return sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  const h = seen[0]
+  assert.match(h.get("x-message-id"), /^[0-9a-f]{32}$/)
+  assert.equal(h.get("x-message-id"), h.get("user-msg-id"))
+  assert.equal(h.get("model-name"), encodeURIComponent("GLM-5.2"))
 })
