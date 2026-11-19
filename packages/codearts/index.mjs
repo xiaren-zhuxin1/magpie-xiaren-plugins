@@ -1873,6 +1873,36 @@ function isRegularModel(model, state) {
  *   agent's own, to put back in the answer; null when none was cut).
  * A body that is not a chat (no `model` + `messages`) gives null.
  */
+/**
+ * The last user turn as the kernel sends it in `user_prompt`: its content,
+ * system reminders stripped, 500 characters at most, newlines flattened. The
+ * gateway's own request column reads this field, and without it the console
+ * falls back to a generic label - it showed 「后台任务」 for this package's
+ * requests while the IDE's showed the prompt itself. "" when there is no user
+ * turn (the field is then left out, as the kernel does).
+ */
+function lastUserPrompt(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (!m || m.role !== "user") continue
+    let text = ""
+    if (typeof m.content === "string") text = m.content
+    else if (Array.isArray(m.content)) {
+      text = m.content
+        .filter((part) => part && part.type === "text" && typeof part.text === "string")
+        .map((part) => part.text)
+        .join("")
+    }
+    text = text
+      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+      .replace(/<system-reminder[\s\S]*$/, "")
+      .trim()
+    if (text.length > 500) text = text.substring(0, 500)
+    return text.replace(/[\r\n\t]/g, " ")
+  }
+  return ""
+}
+
 function prepareChatBody(parsed, { thinking = true, station = "mainland" } = {}) {
   if (!parsed || typeof parsed.model !== "string" || !Array.isArray(parsed.messages)) return null
   const body = { ...parsed, model: upstreamModelId(parsed.model) }
@@ -1911,6 +1941,11 @@ function prepareChatBody(parsed, { thinking = true, station = "mainland" } = {})
   for (const k of ["max_tokens", "max_completion_tokens"]) {
     if (typeof body[k] === "number" && body[k] > MAX_OUTPUT_TOKENS) body[k] = MAX_OUTPUT_TOKENS
   }
+  // What the gateway shows as this request: the last user turn, as the kernel
+  // sends it, and tool-call deltas streamed like the kernel asks for.
+  const prompt = lastUserPrompt(body.messages)
+  if (prompt) body.user_prompt = prompt
+  body.tool_stream = true
   normalizeStop(body, station)
   const fold = body.stream !== true
   body.stream = true
@@ -4696,7 +4731,7 @@ export const _internal = {
   readGrants, recordGrant, readUnconfirmed, recordUnconfirmed, grantExpiry, grantBatches, soonestLapse, bucketLapse, fetchCreditBatches,
   PACKAGE_CREDIT_PAGE_URL, OPS_CREDIT_OVERVIEW_URL, OPS_CREDIT_CAMPAIGN_URL,
   toBytes, isBenefitModel, prepareChatBody, signedFetch, signedGet,
-  TOOL_NAME_LIMIT, cutToolName, shortenToolNames, restoreToolNames, restoreToolNamesInStream,
+  TOOL_NAME_LIMIT, cutToolName, shortenToolNames, lastUserPrompt, restoreToolNames, restoreToolNamesInStream,
   parseSseEvents, errorCodeOf, errorMessageOf, isStaleCredential, isRateLimitCode, embeddedErrorStatus, isNotMultimodal, classifyHead,
   peekAnswer, completionFromChunks, createConcurrencyGate, delay, retryDelayMs,
   isRegularModel, queueInfoOf, waitInQueue, TRACE_QUEUE_URL, SESSION_HEADER,

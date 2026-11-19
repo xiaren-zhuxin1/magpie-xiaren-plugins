@@ -268,7 +268,9 @@ test("stop never reaches the mainland gateway, which refuses any (#1120, magpie#
 test("prepareChatBody reshapes a chat into what the gateway accepts and meters", () => {
   const out = x.prepareChatBody({ model: "codearts/GLM-5.2", messages: [], max_tokens: 128000 })
   assert.equal(out.fold, true)
-  assert.deepEqual(out.body, { model: "GLM-5.2", messages: [], max_tokens: x.MAX_OUTPUT_TOKENS, thinking: { type: "enabled" }, stream: true })
+  // tool_stream is the kernel's own ask: tool-call deltas streamed too. No user
+  // turn here, so no user_prompt.
+  assert.deepEqual(out.body, { model: "GLM-5.2", messages: [], max_tokens: x.MAX_OUTPUT_TOKENS, thinking: { type: "enabled" }, stream: true, tool_stream: true })
 
   const streamed = x.prepareChatBody({ model: "GLM-5.2", messages: [], stream: true, thinking: { type: "disabled" } })
   assert.equal(streamed.fold, false)
@@ -997,7 +999,7 @@ test("loader signs each chat request with SDK-HMAC-SHA256 and sends it metered",
   assert.equal(headers.has("maas_type"), false)
   // The body signed and sent: bare model, explicit thinking, streamed.
   assert.deepEqual(JSON.parse(new TextDecoder().decode(seen[0].init.body)), {
-    model: "GLM-5.2", messages: [], thinking: { type: "enabled" }, stream: true,
+    model: "GLM-5.2", messages: [], thinking: { type: "enabled" }, stream: true, tool_stream: true,
   })
   // The caller asked for JSON, so the stream comes back folded.
   assert.equal(res.headers.get("content-type"), "application/json")
@@ -5234,4 +5236,35 @@ test("ideInstallDir honours the env var and can be kept off the host's records",
   assert.equal(x.ideInstallDir({ env: {}, platform: "linux", noDiscovery: true }), "")
   // an env var pointing at something that is not an IDE app is not taken
   assert.equal(x.ideInstallDir({ env: { MAGPIE_CODEARTS_IDE_DIR: os.tmpdir() }, platform: "linux", noDiscovery: true }), "")
+})
+
+test("user_prompt is the last user turn as the kernel sends it", () => {
+  const f = x.lastUserPrompt
+  // the last user turn wins, trimmed
+  assert.equal(f([{ role: "system", content: "s" }, { role: "user", content: "one" }, { role: "assistant", content: "a" }, { role: "user", content: "  two  " }]), "two")
+  // array content keeps text parts only
+  assert.equal(f([{ role: "user", content: [{ type: "text", text: "a" }, { type: "image", url: "u" }, { type: "text", text: "b" }] }]), "ab")
+  // system reminders are stripped, paired or dangling
+  assert.equal(f([{ role: "user", content: "q<system-reminder>secret</system-reminder>tail" }]), "qtail")
+  assert.equal(f([{ role: "user", content: "q<system-reminder>unterminated" }]), "q")
+  // at most 500 characters, and newlines flattened the way the kernel does it
+  assert.equal(f([{ role: "user", content: "x".repeat(800) }]).length, 500)
+  assert.equal(f([{ role: "user", content: "a\nb\r\nc\td" }]), "a b  c d")
+  // nothing to say: empty, so the field is left out
+  assert.equal(f([{ role: "system", content: "s" }]), "")
+  assert.equal(f([{ role: "user", content: "" }]), "")
+})
+
+test("the chat body carries user_prompt and tool_stream, which the console reads", () => {
+  const { body } = x.prepareChatBody({
+    model: "GLM-5.2",
+    messages: [{ role: "user", content: "顶点匹配和门洞匹配的横线不能统一吗" }],
+    stream: true,
+  })
+  assert.equal(body.user_prompt, "顶点匹配和门洞匹配的横线不能统一吗")
+  assert.equal(body.tool_stream, true)
+  // a body with no user turn still goes, just without the field
+  const { body: noPrompt } = x.prepareChatBody({ model: "GLM-5.2", messages: [{ role: "system", content: "s" }] })
+  assert.equal("user_prompt" in noPrompt, false)
+  assert.equal(noPrompt.tool_stream, true)
 })
