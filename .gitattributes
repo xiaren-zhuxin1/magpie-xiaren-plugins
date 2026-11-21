@@ -15,6 +15,7 @@
 .gitattributes     text eol=lf
 scripts/**         text eol=lf
 packages/codearts/** text eol=lf
+packages/*/opencode2.mjs text eol=lf
 
 *.exe              binary
 *.tgz              binary
