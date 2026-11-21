@@ -15,7 +15,10 @@ let routingReads
 let routingParsed
 beforeAll(async () => {
   // as usage.test.mjs: run with HOME=$(mktemp -d) bun test
-  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
+  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error(
+      "run with HOME=$(mktemp -d) bun test (on Windows set USERPROFILE to a temp dir: "
+      + "node:os homedir() follows USERPROFILE there, not HOME)",
+    )
   ;({ _internal } = await import("./index.mjs"))
   ;({ routingReads, routingParsed } = _internal)
 })

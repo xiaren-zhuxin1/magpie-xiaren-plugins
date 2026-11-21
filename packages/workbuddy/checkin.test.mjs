@@ -6,7 +6,10 @@ import { realpathSync } from "node:fs"
 
 let WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin, _internal
 beforeAll(async () => {
-  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
+  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error(
+      "run with HOME=$(mktemp -d) bun test (on Windows set USERPROFILE to a temp dir: "
+      + "node:os homedir() follows USERPROFILE there, not HOME)",
+    )
   ;({ WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin, _internal } = await import("./index.mjs"))
 })
 const offline = async () => { throw new Error("no network in tests") }
@@ -17,6 +20,7 @@ afterEach(() => {
   globalThis.fetch = offline
   _internal.renewing.clear()
   _internal.renewed.clear()
+  _internal.seenIdentities?.clear()
 })
 
 const later = () => Date.now() + 3600_000

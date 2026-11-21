@@ -308,13 +308,41 @@ function endpointOf(site, a) {
 
 // at is site with a's endpoint (endpointOf): the same site when that is
 // the site's own.
+// Every account identity this process has seen for a site. A renewal writes the
+// site's own record key only while the site has one account: with a second one,
+// that key is where the first account's record sits, and writing it replaces its
+// credentials — measured, two imported sign-ins leave one key for both, and the
+// second renewal overwrote the first account's record and left the second's spent
+// refresh token in the other.
+const seenIdentities = new Map()
+function noteIdentity(site, uid) {
+  const id = str(uid)
+  if (!id) return
+  const set = seenIdentities.get(site.id) ?? new Set()
+  set.add(id)
+  seenIdentities.set(site.id, set)
+}
+/** The key this account's record may be written back to, "" when it may not. */
+function recordKeyToWrite(site, a) {
+  const known = seenIdentities.get(site.id)
+  const id = str(a?.uid)
+  if (id) noteIdentity(site, id)
+  // One account (or none known yet): the site's own key is where it lives.
+  return !known || known.size <= 1 ? site.id : ""
+}
+
 const atHosts = new Map()
 function at(site, a) {
   const end = endpointOf(site, a)
   if (end === site.endpoint) return site
   const key = site.id + "\n" + end
   let s = atHosts.get(key)
-  if (!s) atHosts.set(key, (s = { ...site, endpoint: end }))
+  if (!s) {
+    // Bounded: one entry per (site, enterprise endpoint) for the life of the
+    // process, and nothing else ever took one out.
+    if (atHosts.size >= 64) atHosts.delete(atHosts.keys().next().value)
+    atHosts.set(key, (s = { ...site, endpoint: end }))
+  }
   return s
 }
 
@@ -360,7 +388,10 @@ function refreshable(a) {
 function renew(site, a, save) {
   const key = site.id + "\n" + a.refresh
   const done = renewed.get(key)
-  if (done && Date.now() - done.at < KEEP_RENEWED_MS) return Promise.resolve(merged(a, done.next))
+  // A result whose record could not be written keeps answering however old it is:
+  // the record still holds the token this renewal spent, and nothing else has the
+  // new one.
+  if (done && (done.unsaved || Date.now() - done.at < KEEP_RENEWED_MS)) return Promise.resolve(merged(a, done.next))
   let r = renewing.get(key)
   if (!r) {
     r = (async () => {
@@ -372,8 +403,13 @@ function renew(site, a, save) {
       }, {})
       if (!got?.accessToken) throw Object.assign(new Error("WorkBuddy gave no refreshed token"), { bare: true })
       const next = merge(a, got)
-      renewed.set(key, { next, at: Date.now() })
-      await save?.(next)
+      const saved = (await save?.(next)) !== false
+      renewed.set(key, { next, at: Date.now(), ...(saved ? {} : { unsaved: true }) })
+      // What has stopped answering for the old refresh token is dropped with the
+      // new one: the map holds credentials, spent tokens included, and nothing
+      // else ever took them out. An entry whose record could not be written is
+      // kept — it is the only copy of those tokens now.
+      for (const [k, v] of renewed) if (!v.unsaved && Date.now() - v.at >= KEEP_RENEWED_MS) renewed.delete(k)
       return next
     })().finally(() => renewing.delete(key))
     renewing.set(key, r)
@@ -401,9 +437,22 @@ async function fresh(site, client, a) {
   }
   try {
     return await renew(site, a, async (next) => {
+      const set = client?.auth?.set
+      // A record that is not this site's only account is not written back to the
+      // site's own key: that key is another account's record. The result is kept
+      // in memory instead (see renew), so the token is not lost either way.
+      const key = recordKeyToWrite(site, a)
+      if (!set || !key) return false
       try {
-        await client?.auth?.set?.({ path: { id: site.id }, body: next })
-      } catch {}
+        await set({ path: { id: key }, body: next })
+        return true
+      } catch {
+        // A record that could not be written (a locked file, a full disk) leaves
+        // the next request holding a refresh token this renewal already spent.
+        // Saying so keeps the new one in memory instead of dropping it a minute
+        // later, which is how a healthy account used to end up marked expired.
+        return false
+      }
     })
   } catch (e) {
     if (a.access) return a
@@ -492,13 +541,17 @@ const SDK_ARCH = { x64: "x64", arm64: "arm64", arm: "arm", ia32: "x32", x32: "x3
 // the runtime where a build sends one, and the OpenAI SDK's own headers,
 // which the CLI's fetch passes on. Its client has a 1200s timeout and
 // no retries of its own.
+// The cap the CLI's own client has, and the one this package claims in
+// `X-Stainless-Timeout`: a request with no signal of its own is bounded by it.
+const STAINLESS_TIMEOUT_S = 1200
+
 function chatHeaders(site, headers) {
   headers.set("X-Agent-Type", "main")
   if (site.runtime) headers.set("X-Agent-Runtime", site.runtime)
   else headers.delete("X-Agent-Runtime")
   headers.set("Accept", "application/json")
   headers.set("X-Stainless-Retry-Count", "0")
-  headers.set("X-Stainless-Timeout", "1200")
+  headers.set("X-Stainless-Timeout", String(STAINLESS_TIMEOUT_S))
   headers.set("X-Stainless-Lang", "js")
   headers.set("X-Stainless-Package-Version", OPENAI_SDK)
   headers.set("X-Stainless-OS", SDK_OS[process.platform] ?? (process.platform ? `Other:${process.platform}` : "Unknown"))
@@ -2363,7 +2416,7 @@ function signInsIn(text) {
 function otherSite(site, a) {
   const d = str(a.domain).toLowerCase()
   if (!d) return ""
-  const cn = /(^|\.)(codebuddy\.cn|tencent\.com|qq\.com)$/.test(d)
+  const cn = /(^|\.)(codebuddy\.cn|workbuddy\.cn|tencent\.com|qq\.com)$/.test(d)
   const ai = /(^|\.)workbuddy\.ai$/.test(d)
   if (site.ai && cn) return SITES.workbuddy.name
   if (!site.ai && ai) return SITES["workbuddy-ai"].name
@@ -2377,6 +2430,13 @@ function otherSite(site, a) {
 // list has it signed in to.
 async function importSignIns(site, texts) {
   const results = []
+  // Every sign-in this file brings is known before the first of them is renewed:
+  // whether a renewal may write the site's own key depends on it.
+  for (const text of texts) {
+    for (const got of signInsIn(text)) {
+      if (got?.a?.uid) noteIdentity(site, got.a.uid)
+    }
+  }
   for (const text of texts) {
     for (const got of signInsIn(text)) {
       if (got.error) { results.push({ type: "failed", error: got.error }); continue }
@@ -2979,7 +3039,6 @@ function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
   edges.sort((a, b) => a - b)
 
   const answered = mine.filter((r) => Number(r.status) === 200 && at(r) > 0).sort((a, b) => at(a) - at(b))
-  if (!answered.length) return null
 
   const head = (from) => {
     let start = null
@@ -3019,13 +3078,6 @@ function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
     w = h
     break
   }
-  const start = w?.start
-  const used = w?.used
-  if (!(start > 0)) return null
-
-  const end = start + FREE_WINDOW_SPAN
-  if (now >= end) return null // lapsed: nothing is exhausted, a new window opens on the next request
-
   const card = (amount, resetsAt, refused) => ({
     name: (refused && win.refusedName) || win.name,
     // A refusal is the vendor's word that the window is spent, and says
@@ -3051,6 +3103,22 @@ function freeWindowOf(rows, account, now = Date.now(), win = FREE_WINDOW_AI) {
     // refusal is the one that stops the model (see the window above)
     ...(refused ? { refused: true } : { aside: true }),
   })
+
+  const start = w?.start
+  const used = w?.used
+  if (!(start > 0)) {
+    // No answered row opens a window here. A refusal still names the window it
+    // ended, and that is the case this card exists for: the account is spending
+    // the window from somewhere else, so every local row is a 429. Without a row
+    // of its own the card used to vanish, leaving routing nothing to rest.
+    const edge = edges.filter((t) => t > now).pop()
+    return edge ? card(0, edge, true) : null
+  }
+
+  const end = start + FREE_WINDOW_SPAN
+  if (now >= end) return null // lapsed: nothing is exhausted, a new window opens on the next request
+
+
 
   // A refusal still in force is exact: the account is spending this window
   // from elsewhere too, so the sum undercounts it, and the refusal is the
@@ -4608,6 +4676,7 @@ function makePlugin(site) {
             const keyed = stored?.type === "api" ? keyAccount(stored) : null
             if (stored?.type !== "oauth" && !keyed) throw new Error(`${site.name} isn't signed in`)
             let a = keyed ?? (await current(site, client, stored))
+            noteIdentity(site, a.uid)
             const req = input instanceof Request ? input : null
             const headers = new Headers(init?.headers ?? req?.headers)
             headers.delete("authorization")
@@ -4680,7 +4749,12 @@ function makePlugin(site) {
               const z = gzipped(completion, b)
               if (z) headers.set("Content-Encoding", "gzip")
               else headers.delete("Content-Encoding")
-              return fetch(moved(site, a, String(req ? req.url : input)), { ...init, method: init?.method ?? req?.method, headers, body: z ?? b }).catch((e) => unanswered(site, a, z ?? b, e, init?.signal))
+              // The caller's own abort reaches the upstream: a `Request` as the
+              // input carries its signal there, not in `init`. With neither, the cap
+              // this request already claims in `X-Stainless-Timeout` is what bounds
+              // it — a stalled answer used to hang the turn with nothing to stop it.
+              const signal = init?.signal ?? req?.signal ?? AbortSignal.timeout(STAINLESS_TIMEOUT_S * 1000)
+              return fetch(moved(site, a, String(req ? req.url : input)), { ...init, method: init?.method ?? req?.method, headers, body: z ?? b, signal }).catch((e) => unanswered(site, a, z ?? b, e, signal))
             }
             // a 401 is answered once, on whichever try meets it: by a
             // sign-in with another access token (reissued), the request
@@ -5059,4 +5133,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { replyFacts, reportEvents, stepOf, reporting, machineOf, endpointOf, moved, at, signInsIn, importSignIns, importFrom, otherSite, withGrowth, inputLengthOf, HIDE_DSH, hideDsh, dshHidden, planCodes, listedExtra, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, SMALL_BUDGET, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, freeWindowRouting, routingRefusalRows, readRoutingRefusals, readLedgerTail, pinned, pinning, rowTime, rowAccount, ofAccount, windowOffset, windowReset, CN_ESTIMATED_WINDOWS, FREE_WINDOW_AI, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM, routingReads, routingParsed, restIdentity, routingLines, ROUTING_LINE_MAX }
+export const _internal = { replyFacts, reportEvents, stepOf, reporting, machineOf, endpointOf, moved, at, signInsIn, importSignIns, importFrom, otherSite, withGrowth, inputLengthOf, HIDE_DSH, hideDsh, dshHidden, planCodes, listedExtra, idFor, OFF_TAKEN, replyAfterToolsOn, withDefaultEffort, SMALL_BUDGET, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, accountName, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unsaid, FILTER_SAYS, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, REFUSED_DOC, commaPaused, commaPausedOn, opened, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, seenIdentities, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, freeWindowRouting, routingRefusalRows, readRoutingRefusals, readLedgerTail, pinned, pinning, rowTime, rowAccount, ofAccount, windowOffset, windowReset, CN_ESTIMATED_WINDOWS, FREE_WINDOW_AI, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, checkinOf, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM, routingReads, routingParsed, restIdentity, routingLines, ROUTING_LINE_MAX }

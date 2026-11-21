@@ -10,7 +10,10 @@ let WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin, _internal, home
 beforeAll(async () => {
   // Bun reads HOME once, at start: run as HOME=$(mktemp -d) bun test, so
   // no real sign-in is ever read
-  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
+  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error(
+      "run with HOME=$(mktemp -d) bun test (on Windows set USERPROFILE to a temp dir: "
+      + "node:os homedir() follows USERPROFILE there, not HOME)",
+    )
   home = homedir()
   ;({ WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin, _internal } = await import("./index.mjs"))
 })
@@ -23,6 +26,7 @@ const real = globalThis.fetch
 globalThis.fetch = offline
 afterAll(() => (globalThis.fetch = real))
 afterEach(() => {
+  _internal.seenIdentities?.clear()
   globalThis.fetch = offline
   _internal.desktopHeld.clear()
 })

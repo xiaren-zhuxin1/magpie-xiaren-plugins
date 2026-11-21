@@ -6,7 +6,10 @@ import { realpathSync } from "node:fs"
 
 let WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin, _internal
 beforeAll(async () => {
-  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
+  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error(
+      "run with HOME=$(mktemp -d) bun test (on Windows set USERPROFILE to a temp dir: "
+      + "node:os homedir() follows USERPROFILE there, not HOME)",
+    )
   ;({ WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin, _internal } = await import("./index.mjs"))
 })
 const offline = async () => { throw new Error("no network in tests") }
@@ -17,6 +20,7 @@ afterEach(() => {
   globalThis.fetch = offline
   _internal.renewing.clear()
   _internal.renewed.clear()
+  _internal.seenIdentities?.clear()
 })
 
 const ok = (data) => new Response(JSON.stringify({ code: 0, msg: "ok", data }))
@@ -122,4 +126,40 @@ test("nothing to renew with gives nothing", async () => {
   expect(await hooks.auth.refresh({ type: "oauth", source: "desktop", refresh: "", access: "", expires: 0, uid: "u" }, "workbuddy")).toBeUndefined()
   expect(await hooks.auth.refresh({ type: "api", key: "k" }, "workbuddy")).toBeUndefined()
   expect(refreshes(calls).length).toBe(0)
+})
+
+test("what a renewal kept for the old token is dropped once it can no longer answer", async () => {
+  // `renewed` holds the credential a rotation gave, so the old refresh token's
+  // holder takes that instead of spending it. It is only useful for a minute, and
+  // nothing else ever took an entry out: every rotation left a spent refresh token
+  // and an access token in memory for the life of the process.
+  serve(() => ok(NEW))
+  const stale = Date.now() - 2 * 60 * 1000
+  _internal.renewed.set("workbuddy\nr0", { next: { access: "old", refresh: "r0" }, at: stale })
+  const hooks = await WorkBuddyAuthPlugin({ client: { auth: { set: async () => ({}) } } })
+  const got = await hooks.auth.refresh(auth(), "workbuddy")
+  expect(got.refresh).toBe("r2")
+  expect(_internal.renewed.has("workbuddy\nr0")).toBe(false)
+  expect(_internal.renewed.size).toBe(1)
+})
+
+test("a renewal whose record could not be written is kept, not dropped a minute later", async () => {
+  // The record write is best effort: a locked file or a full disk fails it. The
+  // new tokens are then the only copy there is, and the record still holds a
+  // refresh token this renewal already spent — dropping them a minute later is
+  // how a healthy account used to end up marked expired.
+  const calls = serve(() => ok(NEW))
+  const site = Object.values(_internal.SITES)[0]
+  const locked = { auth: { set: async () => { throw new Error("auth.json is locked") } } }
+  const stale = { type: "oauth", access: "old", refresh: "r-locked", uid: "u1", domain: "", expires: Date.now() - 1000 }
+
+  const first = await _internal.fresh(site, locked, stale)
+  expect(first.access).toBe("new")
+  // past the minute a saved result answers for
+  for (const [, v] of _internal.renewed) v.at -= 2 * 60 * 1000
+  expect(_internal.renewed.size).toBe(1)
+  // the same account asks again: the kept result answers, the spent token is not spent twice
+  const again = await _internal.fresh(site, locked, stale)
+  expect(again.access).toBe("new")
+  expect(refreshes(calls).length).toBe(1)
 })
