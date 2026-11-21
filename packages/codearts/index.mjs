@@ -679,24 +679,38 @@ function kernelVersion(options = {}) {
 
 /**
  * This host's private IPv4, the shape the real kernel reports (`10.1.1.147`).
- * "" when the host has none, or when the user turned it off with
- * `MAGPIE_CODEARTS_CLIENT_IP=off` — through a proxy the address the kernel would
- * report and the address the request leaves from differ, and saying one while
- * the other is used is a worse signal than saying neither.
+ *
+ * `MAGPIE_CODEARTS_CLIENT_IP` decides it outright: `off` sends none, and any
+ * IPv4 written there is sent as it is. Through a proxy the address this host
+ * reports and the address the request leaves from differ, and saying one while
+ * the other is used is a worse signal than saying neither — so the escape hatch
+ * is the user's to take. A host with several private addresses (a Hyper-V or
+ * Docker adapter beside the cable) reports the first one found; the override is
+ * how a user says which one a machine would really name.
  *
  * Only a found address is remembered: an empty answer is looked up again next
  * time, so a network that comes up (or a VPN that reconnects) is picked up
  * rather than leaving the header missing for the life of the process.
  */
 let _clientIp
+// The three ranges a LAN address lives in: 10/8, 172.16/12, 192.168/16. Each
+// alternative spells its own octet count, so a two-octet prefix (192.168) is
+// followed by two octets and a one-octet prefix (10) by three.
+const PRIVATE_IPV4 = /^(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})$/
+const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/
 function clientIp(env = process.env) {
-  if (firstOf(env?.[CLIENT_IP_ENV]).toLowerCase() === "off") return ""
+  const asked = firstOf(env?.[CLIENT_IP_ENV])
+  if (asked.toLowerCase() === "off") return ""
+  // An address written by hand is sent verbatim, private or not: the user is
+  // describing their own network, and the kernel would report whatever its
+  // interface carries.
+  if (IPV4.test(asked)) return asked
   if (_clientIp) return _clientIp
   try {
     for (const list of Object.values(os.networkInterfaces() ?? {})) {
       for (const a of list ?? []) {
         if (a?.family !== "IPv4" || a.internal) continue
-        if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address)) {
+        if (PRIVATE_IPV4.test(a.address)) {
           _clientIp = a.address
           return _clientIp
         }
@@ -1070,6 +1084,9 @@ function sm4GcmOpen(key, iv, ciphertext, authTag, aad) {
 
 const KEY_EXCHANGE_PATH = "/api/v1/security/key-exchange"
 const SM4_ALGO = "sm4-gcm"
+/** A sealed frame's shapes: a 12-byte IV and a 16-byte GCM tag (its client's). */
+const SM4_IV_BYTES = 12
+const SM4_TAG_BYTES = 16
 /** Reuse a key until this close to its stated expiry, as the client does. */
 const KEY_EARLY_MS = 300_000
 
@@ -1081,27 +1098,39 @@ const KEY_EARLY_MS = 300_000
  */
 function createKeyNegotiator(crypto = nodeCrypto()) {
   const cached = new Map()
+  // One negotiation per host at a time: a cold cache with several chats in flight
+  // would otherwise run that many ECDH exchanges and POSTs, each overwriting the
+  // last, and every one of them a request the client never makes.
+  const pending = new Map()
   return {
-    async getKey(baseUrl, exchange) {
+    getKey(baseUrl, exchange) {
       const hit = cached.get(baseUrl)
-      if (hit && Date.now() < hit.expiresAt - KEY_EARLY_MS) return hit
-      const ecdh = crypto.createECDH("prime256v1")
-      ecdh.generateKeys()
-      const clientPublicKey = ecdh.getPublicKey().toString("base64")
-      const sessionId = crypto.randomBytes(16).toString("hex")
-      const timestamp = Date.now()
-      const res = await exchange({ clientPublicKey, sessionId, timestamp })
-      if (!res?.serverPublicKey || !res?.keyId) throw new Error("CodeArts: key exchange answered without serverPublicKey/keyId")
-      const shared = ecdh.computeSecret(Buffer.from(res.serverPublicKey, "base64"))
-      const key = crypto.createHash("sha256").update(shared).digest().subarray(0, 16)
-      const ttl = Number(res.expiresIn)
-      const entry = {
-        key,
-        keyId: String(res.keyId),
-        expiresAt: Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 3_600_000),
-      }
-      cached.set(baseUrl, entry)
-      return entry
+      if (hit && Date.now() < hit.expiresAt - KEY_EARLY_MS) return Promise.resolve(hit)
+      const under = pending.get(baseUrl)
+      if (under) return under
+      const run = (async () => {
+        const ecdh = crypto.createECDH("prime256v1")
+        ecdh.generateKeys()
+        const clientPublicKey = ecdh.getPublicKey().toString("base64")
+        const sessionId = crypto.randomBytes(16).toString("hex")
+        const timestamp = Date.now()
+        const res = await exchange({ clientPublicKey, sessionId, timestamp })
+        if (!res?.serverPublicKey || !res?.keyId) throw new Error("CodeArts: key exchange answered without serverPublicKey/keyId")
+        const shared = ecdh.computeSecret(Buffer.from(res.serverPublicKey, "base64"))
+        const key = crypto.createHash("sha256").update(shared).digest().subarray(0, 16)
+        const ttl = Number(res.expiresIn)
+        const entry = {
+          key,
+          keyId: String(res.keyId),
+          expiresAt: Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 3_600_000),
+        }
+        cached.set(baseUrl, entry)
+        return entry
+      })().finally(() => {
+        if (pending.get(baseUrl) === run) pending.delete(baseUrl)
+      })
+      pending.set(baseUrl, run)
+      return run
     },
     forget(baseUrl, keyId) {
       const hit = cached.get(baseUrl)
@@ -1142,6 +1171,11 @@ async function exchangeSessionKey(base, payload, cred, fetcher) {
  * A sealed answer: every SSE line past the first carries `iv|tag|ciphertext`
  * (base64, split on ':') with AAD `${keyId}|${chunkIndex}`. Rebuilt as a plain
  * SSE stream so all the ordinary parsing above it keeps working.
+ *
+ * The rebuilt stream is driven by its consumer, and cancels the sealed one when
+ * it is cancelled: a body nobody reads must stop the upstream request rather than
+ * leave it streaming — the gateway holds a session for as long as its answer is
+ * open, and that is one of the account's three.
  */
 function decryptSealedResponse(res, sealInfo) {
   if (!res?.body) return res
@@ -1156,45 +1190,58 @@ function decryptSealedResponse(res, sealInfo) {
   const encoder = new TextEncoder()
   let buffer = ""
   let index = 0
+  // A sealed line is `iv:tag:ciphertext` (base64). What it opens to is a WHOLE
+  // SSE line — the server encrypts the `data: ` prefix too (measured: every
+  // chunk decrypted to `data:{…}`, the last one to `data:[DONE]`) — so the
+  // plaintext is passed through as it came, never re-prefixed.
+  //
+  // Three colon-separated fields are not proof of a sealed frame: a plaintext
+  // line such as `data:{"id":"x"}` has them too. A frame is only one when its
+  // first two fields decode to a 12-byte IV and a 16-byte tag, so a line that is
+  // not is passed untouched instead of failing the whole stream.
+  const chunkText = (line, i) => {
+    const parts = line.trim().split(":")
+    if (parts.length !== 3) return line
+    const iv = Buffer.from(parts[0], "base64")
+    if (iv.length !== SM4_IV_BYTES) return line
+    const tag = Buffer.from(parts[1], "base64")
+    if (tag.length !== SM4_TAG_BYTES) return line
+    const ct = Buffer.from(parts[2], "base64")
+    const plain = sm4GcmOpen(key, iv, ct, tag, Buffer.from(`${aadPrefix}|${i}`, "utf8"))
+    return plain.toString("utf8")
+  }
   const body = new ReadableStream({
-    async start(controller) {
+    async pull(controller) {
       try {
         for (;;) {
-          const { done, value } = await reader.read()
-          if (done) {
-            if (buffer.trim()) controller.enqueue(encoder.encode(chunkText(buffer.trim(), index)))
-            controller.close()
-            return
-          }
-          buffer += decoder.decode(value, { stream: true })
-          let at
-          while ((at = buffer.indexOf("\n\n")) !== -1) {
+          const at = buffer.indexOf("\n\n")
+          if (at !== -1) {
             const line = buffer.slice(0, at).trim()
             buffer = buffer.slice(at + 2)
             if (!line) continue
             controller.enqueue(encoder.encode(chunkText(line, index) + "\n\n"))
             index += 1
+            return
           }
+          const { done, value } = await reader.read()
+          if (done) {
+            const rest = buffer.trim()
+            buffer = ""
+            if (rest) controller.enqueue(encoder.encode(chunkText(rest, index)))
+            controller.close()
+            return
+          }
+          buffer += decoder.decode(value, { stream: true })
         }
       } catch (err) {
         controller.error(err)
       }
     },
+    cancel(reason) {
+      // The sealed answer behind this one goes with it.
+      return reader.cancel(reason)
+    },
   })
-  const chunkText = (line, i) => {
-    // A sealed line is `iv:tag:ciphertext` (base64). What it opens to is a WHOLE
-    // SSE line — the server encrypts the `data: ` prefix too (measured: every
-    // chunk decrypted to `data:{…}`, the last one to `data:[DONE]`) — so the
-    // plaintext is passed through as it came, never re-prefixed. A line that is
-    // not three base64 fields was never sealed and passes untouched.
-    const parts = line.trim().split(":")
-    if (parts.length !== 3) return line
-    const iv = Buffer.from(parts[0], "base64")
-    const tag = Buffer.from(parts[1], "base64")
-    const ct = Buffer.from(parts[2], "base64")
-    const plain = sm4GcmOpen(key, iv, ct, tag, Buffer.from(`${aadPrefix}|${i}`, "utf8"))
-    return plain.toString("utf8")
-  }
   const headers = new Headers(res.headers)
   headers.delete("X-Encrypt-Algo")
   headers.delete("X-Encrypt-Key-Id")
@@ -1537,7 +1584,7 @@ async function refreshCredential(cred, fetcher) {
   if (!next.refresh_token) next.refresh_token = refreshToken
   // Preserve non-rotating identity fields a legacy login may have carried, and
   // the session id: it belongs to the account, not to the token.
-  for (const k of ["domain_id", "user_id", "user_name", "session_id", "station"]) {
+  for (const k of ["domain_id", "user_id", "user_name", "session_id", "station", "record_key"]) {
     if (cred[k]) next[k] = cred[k]
   }
   return next
@@ -1571,32 +1618,206 @@ async function accountSessionIds(cred, conversation = "") {
   return { sessionId: accountSessionId, accountSessionId }
 }
 
-// The kernel's own session ids look like `ses_1a2b3c4d5e6f7g8h9i0j1k2l`: a
-// `ses_` prefix and 24 base62 characters (measured, [header-debug] full
-// headers). A 32-hex id is a giveaway that no CodeArts client made the request,
-// so ids are shaped the same way here; the value still comes from the account's
-// own digest, so one account keeps one id.
-const SESSION_ID_PREFIX = "ses_"
-const SESSION_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+// Every id the kernel mints — `ses_`, `msg_`, `prt_`, `evt_` … — has the same
+// body: twelve lowercase hex, then fourteen base62, so 26 characters after the
+// prefix, and the hex head is the millisecond it was made in (its
+// `Identifier.make`: `(ms * 4096 + counter)` cut to 48 bits). Two ids copied out
+// of a real [header-debug] line, the boundary marked with a space that is not
+// part of them:
+//
+//   ses_ e06256bdbffe Ngmz0ue4jkzDGn
+//   msg_ 1f9da9794001 GEVDgWOPjH0Zjp     12 hex + 14 base62 = 26
+//
+// A 24-character or 32-hex id is a giveaway that no CodeArts client made the
+// request, and so is a head that is not a recent moment: both halves are written
+// the way the kernel writes them. The base62 tail is what carries identity — the
+// account's own digest for a session (one account keeps one session id), random
+// bytes for a message — so no two ids of one millisecond collide.
+const ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+const ID_HEX_CHARS = 12
+const ID_TAIL_CHARS = 14
+// The prefix as `Identifier` names it; the underscore is the separator.
+const SESSION_ID_PREFIX = "ses"
+const MESSAGE_ID_PREFIX = "msg"
 
-/** A digest's bytes as the kernel writes a session id: `ses_` + 24 base62. */
-function sessionIdFromDigest(digestHex) {
-  const bytes = Buffer.from(String(digestHex).slice(0, 48), "hex")
-  let out = ""
-  for (let i = 0; i < 24 && i < bytes.length; i++) out += SESSION_ID_ALPHABET[bytes[i] % 62]
-  return SESSION_ID_PREFIX + out
+// The twelve hex characters are a moment in time, not noise: the kernel writes
+// `(ms * 4096 + counter)` cut to its low 48 bits, the counter reset whenever the
+// millisecond moves (its `Identifier.make`). Decoding two real ids against the
+// `created-time` of the same request showed exactly that. So the head is written
+// the same way here — an id whose first twelve characters are not a recent
+// timestamp is an id no CodeArts client minted.
+let _headMs = 0
+let _headCount = 0
+function idHead(at = Date.now()) {
+  if (at !== _headMs) {
+    _headMs = at
+    _headCount = 0
+  }
+  _headCount += 1
+  return ((BigInt(at) * 4096n + BigInt(_headCount)) & 0xFFFFFFFFFFFFn).toString(16).padStart(ID_HEX_CHARS, "0")
 }
 
-// The kernel's message ids look like `msg_1a2b3c4d5e6fAbCdEfGhIjKlMn`: `msg_`,
-// twelve lowercase hex, then fourteen base62 — 26 characters after the prefix
-// (measured on eight ids). The counter those first characters encode is not ours
-// to reproduce; only the shape is, and a 32-hex id would stand out.
-function newMessageId() {
-  const bytes = randomBytes(20)
-  let out = "msg_"
-  for (let i = 0; i < 6; i++) out += bytes[i].toString(16).padStart(2, "0")
-  for (let i = 6; i < 20; i++) out += SESSION_ID_ALPHABET[bytes[i] % 62]
+/** The 14 base62 characters after the head, from bytes. */
+function idTail(bytes) {
+  let out = ""
+  for (let i = 0; i < ID_TAIL_CHARS; i++) out += ID_ALPHABET[bytes[i % bytes.length] % ID_ALPHABET.length]
   return out
+}
+
+/**
+ * A kernel-shaped id: `<prefix>_` + 12 hex (a moment) + 14 base62.
+ * `head` is the hex head to write; `tail` is the bytes behind the base62 tail.
+ */
+function kernelId(prefix, { head, tail }) {
+  return `${prefix}_${head}${idTail(tail)}`
+}
+
+// A session's head has to stand still for as long as the session does, so it is
+// minted once per account (or per pool slot) and remembered: a session id that
+// re-dated itself on every request would be a tell of its own.
+//
+// The cache is least-recently-used and large: the account's own state — its
+// in-flight permits, its session pool, its turn ids — is keyed on this id, so an
+// entry evicted while the account is alive would hand it a second identity and a
+// second set of three sessions. Sixty-four accounts' worth are remembered, and a
+// hit moves its seed to the back.
+const SESSION_HEAD_CAP = 256
+const sessionHeads = new Map()
+
+function sessionHead(seed) {
+  const held = sessionHeads.get(seed)
+  if (held) {
+    sessionHeads.delete(seed)
+    sessionHeads.set(seed, held)
+    return held
+  }
+  const head = idHead()
+  if (sessionHeads.size >= SESSION_HEAD_CAP) sessionHeads.delete(sessionHeads.keys().next().value)
+  sessionHeads.set(seed, head)
+  return head
+}
+
+/**
+ * A digest's bytes as the kernel writes a session id (`ses_` + 26). A digest that
+ * holds no bytes would index past every byte of an empty buffer — the tail then
+ * spells `undefined` — so it falls back to random bytes: a shape this plugin must
+ * never print into a header.
+ */
+function sessionIdFromDigest(digestHex) {
+  const seed = String(digestHex)
+  const bytes = Buffer.from(seed.slice(0, ID_TAIL_CHARS * 2), "hex")
+  return kernelId(SESSION_ID_PREFIX, {
+    head: sessionHead(seed),
+    tail: bytes.length > 0 ? bytes : randomBytes(ID_TAIL_CHARS),
+  })
+}
+
+// Message ids are the same shape under `msg_`, and their head carries the moment
+// the message was made: the same clock, the same counter.
+function newMessageId() {
+  return kernelId(MESSAGE_ID_PREFIX, { head: idHead(), tail: randomBytes(ID_TAIL_CHARS) })
+}
+
+// One conversation turn is one trace and one user-message id. The real kernel
+// keeps `x-ot-trace-id` and `user-msg-id` fixed across every request of a turn
+// and moves only `x-ot-span-id` and the snap trace's suffix (measured: six
+// requests of one tool loop repeated the trace `a7cc28c5…` and the message
+// `msg_1f9e567bf001…` while `messageCount` ran 4 → 6 → 8 → 17 → 19 → 22).
+//
+// magpie tells the `chat.headers` hook no message id (its `message.id` is an
+// empty string), so the turn is read off the body instead: its last user
+// message, and how many user messages the history holds. Inside a tool loop both
+// stand still — the loop appends assistant and tool turns — and a new user
+// message moves both, which is exactly the boundary the kernel's ids follow.
+//
+// `textHash` is carried alongside so that a history compacted mid-turn — which
+// drops earlier messages, and with them the count — is recognised as the same
+// turn instead of taking new ids halfway through (see turnIdsOf).
+function turnKeyOf(conversation, parsed) {
+  const messages = Array.isArray(parsed?.messages) ? parsed.messages : []
+  let users = 0
+  let last = null
+  for (const m of messages) {
+    if (!m || m.role !== "user") continue
+    users += 1
+    last = m
+  }
+  const seed = conversation || ""
+  if (!last) return { key: "", textHash: "", users: 0, conversation: seed }
+  const text = typeof last.content === "string"
+    ? last.content
+    : Array.isArray(last.content)
+      ? last.content.filter((p) => p && p.type === "text" && typeof p.text === "string").map((p) => p.text).join("")
+      : ""
+  const textHash = createHash("sha256").update(text).digest("hex").slice(0, 16)
+  const key = createHash("sha256").update(`${seed}\u0000${users}\u0000${text}`).digest("hex").slice(0, 32)
+  return { key, textHash, users, conversation: seed }
+}
+
+// How many turns an account remembers. The key is content-addressed, so a turn
+// that comes back asks for its own ids again however long it has been idle —
+// which is what the kernel does with a message id. Only the count is bounded,
+// and the least recently used goes first: an id it hands back to a returning
+// turn is one this account already used, never a fresh one that breaks the
+// turn's continuity.
+const TURN_CAP = 128
+const TURN_EVICT = 64
+
+/**
+ * The `{ traceId, messageId }` of the turn `turn` names, minted on first sight.
+ *
+ * A turn whose history was compacted mid-run loses earlier user messages, so its
+ * count — and with it its key — moves. The last user message is still the same
+ * one, so a key that misses is checked against the conversation's previous turn:
+ * the same text with no more user messages than it had means the history shrank
+ * under this turn, and it keeps its ids. A new message can only raise that count,
+ * so it still gets ids of its own.
+ *
+ * One case is indistinguishable from the body alone: the identical last words
+ * sent again after a compaction silently dropped the user count back to what the
+ * earlier turn had. That turn then reuses the earlier ids instead of minting new
+ * ones — one repeated trace-and-message pair in telemetry, and nothing more.
+ */
+function turnIdsOf(state, turn) {
+  const fresh = { traceId: randomHex(16), messageId: newMessageId() }
+  const key = firstOf(turn?.key)
+  // No turn to name (no conversation, or a body with no user message): this
+  // request stands alone.
+  if (!key || !state?.turns) return fresh
+  const held = state.turns.get(key)
+  if (held) {
+    // Re-inserted so the map's order stays least-recently-used first.
+    state.turns.delete(key)
+    state.turns.set(key, held)
+    noteTurn(state, turn, held)
+    return held
+  }
+  const previous = state.lastTurn?.get(turn.conversation)
+  if (previous && previous.textHash === turn.textHash && turn.users <= previous.users) {
+    // The same message, in a history that has only shrunk: the same turn.
+    state.turns.set(key, previous.ids)
+    noteTurn(state, turn, previous.ids)
+    return previous.ids
+  }
+  if (state.turns.size >= TURN_CAP) {
+    for (const old of [...state.turns.keys()].slice(0, TURN_EVICT)) state.turns.delete(old)
+  }
+  state.turns.set(key, fresh)
+  noteTurn(state, turn, fresh)
+  return fresh
+}
+
+/** Remember the turn a conversation last ran, to recognise it after a compaction. */
+function noteTurn(state, turn, ids) {
+  if (!state?.lastTurn || !turn?.conversation) return
+  const held = state.lastTurn.get(turn.conversation)
+  // The high-water mark of the count: a compacted history must not lower it, or
+  // the same text in a later turn would look like this one again.
+  const users = Math.max(turn.users, held?.textHash === turn.textHash ? held.users : 0)
+  if (state.lastTurn.size >= TURN_CAP && !held) {
+    for (const old of [...state.lastTurn.keys()].slice(0, TURN_EVICT)) state.lastTurn.delete(old)
+  }
+  state.lastTurn.set(turn.conversation, { textHash: turn.textHash, users, ids })
 }
 
 /**
@@ -1825,10 +2046,21 @@ async function toBytes(body) {
   if (typeof body?.getReader === "function") {
     const chunks = []
     const reader = body.getReader()
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      chunks.push(typed(value))
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        chunks.push(typed(value))
+      }
+    } catch (err) {
+      // A stream that broke while being read still gets its lock released: the
+      // transport would otherwise hold it for the life of the object.
+      try {
+        await reader.cancel(err)
+      } catch {
+        /* nothing left to cancel */
+      }
+      throw err
     }
     const total = chunks.reduce((n, c) => n + c.length, 0)
     const out = new Uint8Array(total)
@@ -2104,8 +2336,16 @@ function restoreToolNamesInStream(stream, names) {
     const choices = []
     for (const [key, c] of calls) {
       if (c.sent >= c.got.length) continue
-      const [ci, ti] = key.split(":").map(Number)
-      choices.push({ index: ci, delta: { tool_calls: [{ index: ti, function: { name: c.got.slice(c.sent) } }] } })
+      const [ci, ti] = key.split(":")
+      // A `function_call` carries no index of its own (its key ends in `fc`):
+      // its held-back tail goes back as a `function_call` delta, not as a tool
+      // call at index null.
+      if (ti === "fc") {
+        choices.push({ index: Number(ci), delta: { function_call: { name: c.got.slice(c.sent) } } })
+        c.sent = c.got.length
+        continue
+      }
+      choices.push({ index: Number(ci), delta: { tool_calls: [{ index: Number(ti), function: { name: c.got.slice(c.sent) } }] } })
       c.sent = c.got.length
     }
     return choices.length ? `data: ${JSON.stringify({ choices })}\n\n` : ""
@@ -2540,6 +2780,52 @@ function queueInfoOf(headers) {
   return { traceId, retryAfter: Number.isFinite(after) && after >= 0 ? after : 5 }
 }
 
+/**
+ * The `x-…` headers a CodeArts chat carries, and the only ones it may carry. The
+ * kernel's provider rebuilds its request headers from exactly this list, so
+ * anything else — the SDK's own `x-session-affinity`, `x-message-id`,
+ * `x-session-user-message`, the transport-security hook's `X-Encrypt-Capable`, or
+ * whatever a host added — never reaches the wire (measured: those four sit in
+ * `_existingHeaders` and are absent from the `full headers` the provider signs).
+ */
+const CHAT_X_HEADERS = new Set([
+  "x-ot-session-id", "user-session-id", "x-ot-parent-session-id",
+  "x-ot-trace-id", "x-ot-span-id", "x-snap-traceid", "x-ot-function",
+  "x-ot-client-type", "x-ot-client-version", "user-msg-id",
+  "x-security-token", "x-sdk-date", "x-sdk-content-sha256",
+  "x-language", "x-encrypt-algo", "x-encrypt-key-id",
+  "x-encrypt-iv", "x-encrypt-tag", "x-encrypt-ts",
+])
+
+/** Drop every `x-…` header of a chat that is not one the kernel sends. */
+function pruneChatHeaders(headers) {
+  for (const name of [...headers.keys()]) {
+    const lower = name.toLowerCase()
+    if (lower.startsWith("x-") && !CHAT_X_HEADERS.has(lower)) headers.delete(name)
+  }
+}
+
+/**
+ * Is a sealed request's refusal about the seal — the one thing a plaintext retry
+ * can fix? Everything else is the account's or the server's, and a second copy
+ * would only spend a request, and drop a key that still works:
+ *
+ * - the gateway holding the request still (`queue-status: queued`): the caller's
+ *   loop waits in its queue;
+ * - a session cap or tenant state (any `TM.*` code);
+ * - a spent quota or a rate limit;
+ * - a stale credential (401/403): the loop renews and retries itself;
+ * - a server-side fault (5xx): transient, and the caller fails over.
+ */
+function sealBlamed(status, headers, text) {
+  if (queueInfoOf(headers)) return false
+  const code = errorCodeOf(text)
+  if (/^TM\./.test(code) || isRateLimitCode(code)) return false
+  if (status === 401 || status === 403) return false
+  if (status >= 500) return false
+  return true
+}
+
 /** One signed call on a queued trace: GET is where it stands, DELETE takes it out. */
 async function traceQueueCall(method, cred, traceId, context, signal) {
   const url = onStation(TRACE_QUEUE_URL(traceId), cred)
@@ -2559,10 +2845,17 @@ function withinMs(signal, ms) {
  * `retry-after` seconds until the trace is promoted (then the request is sent
  * again), and leave the queue when the caller gives up or the wait runs out.
  * Gives "promoted" or "gone"; throws the abort.
+ *
+ * The wait is floored at one second. `retry-after: 0` is a legal answer ("ask
+ * again at once"), and without a floor a trace that stays `queued` turns the
+ * whole queue — up to five minutes of it — into hundreds of polls a second.
  */
+const QUEUE_POLL_FLOOR_S = 1
+const pollSeconds = (n) => Math.max(QUEUE_POLL_FLOOR_S, Math.ceil(Number(n) || 0))
+
 async function waitInQueue(cred, queued, context, signal, deadline) {
   const leave = () => void traceQueueCall("DELETE", cred, queued.traceId, context, AbortSignal.timeout(REQUEST_TIMEOUT_MS)).catch(() => {})
-  let retryAfter = queued.retryAfter
+  let retryAfter = pollSeconds(queued.retryAfter)
   let failures = 0
   try {
     for (;;) {
@@ -2588,7 +2881,7 @@ async function waitInQueue(cred, queued, context, signal, deadline) {
       const status = String(body?.status ?? "queued")
       if (status === "promoted") return "promoted"
       if (status === "not_found" || status === "error") return "gone"
-      retryAfter = num(body?.retry_after) || retryAfter
+      retryAfter = pollSeconds(num(body?.retry_after) || retryAfter)
     }
   } catch (e) {
     leave()
@@ -2740,28 +3033,36 @@ async function signedFetch(cred, input, init, context) {
   let active = cred
   // The seal of the last send (null when plaintext); a sealed answer is already
   // decrypted inside send(), so callers only ever see the plain Response.
-  let lastSeal = null
   const urlBase = `${new URL(url).protocol}//${new URL(url).host}`
-  // The session/client headers the real kernel sends on every chat (measured
-  // [header-debug] full headers). Unsigned: set after signFor(), together with
-  // the X-Encrypt-* ones, so a signature covers none of them. Used both for the
-  // sealed call and for the plaintext retry after it.
+  // The turn this request belongs to. Its trace id and its user-message id are
+  // the turn's, not the request's: every request of one turn repeats both
+  // (measured, six requests of one tool loop), so they are resolved once here
+  // and reused by the plaintext retry too. The turn is keyed on the conversation
+  // the host named, not on the upstream session id it is sent under: a pool slot
+  // may be handed to another conversation and back, and the turn's ids must not
+  // move with it.
+  const turn = turnIdsOf(context.state, chat ? turnKeyOf(conversation || sessionId, parsed) : null)
+  // The IDE version this request claims, read once per request. "" means it could
+  // not be read — and then nothing claims it, not even the seal (see below).
+  const version = context.versionOf ? context.versionOf() : clientVersion()
+  // The signed header set the real kernel puts on a chat, and nothing besides
+  // (measured [header-debug] full headers; the provider rebuilds `Se` from a
+  // whitelist, so what it does not list never reaches the wire). Unsigned: set
+  // after signFor(), together with the X-Encrypt-* ones.
   const applyChatHeaders = (headers) => {
     headers.set(SESSION_HEADER, sessionId)
     headers.set("user-session-id", sessionId)
     headers.set("x-ot-parent-session-id", "")
-    // One trace per request, and the snap traceid is that same trace plus its own
-    // suffix (`<trace-id>_<16 hex>`, measured 22/22 on the real kernel), not an
-    // unrelated random id.
-    const traceId = randomHex(16)
-    headers.set("x-ot-trace-id", traceId)
-    headers.set("x-snap-traceid", `${traceId}_${randomHex(8)}`)
+    // One trace per turn; one span and one snap suffix per request. The snap
+    // traceid is the turn's trace plus its own 16 hex (`<trace-id>_<16 hex>`,
+    // measured 22/22 on the real kernel), not an unrelated random id.
+    headers.set("x-ot-trace-id", turn.traceId)
+    headers.set("x-snap-traceid", `${turn.traceId}_${randomHex(8)}`)
     headers.set("x-ot-span-id", randomHex(8))
-    // The IDE version this request claims. Left off entirely when it cannot
-    // be read: a guessed one could contradict what the request does (sealing the
+    // The IDE version this request claims. Left off entirely when it cannot be
+    // read: a guessed one could contradict what the request does (sealing the
     // body is a 26.11.200 behaviour), and a missing header reads as a version
     // difference where a contradicted one does not.
-    const version = clientVersion()
     headers.set("x-ot-client-type", CLIENT_TYPE)
     if (version) headers.set("x-ot-client-version", version)
     headers.set("plugin-name", CLIENT_PLUGIN_NAME)
@@ -2778,21 +3079,22 @@ async function signedFetch(cred, input, init, context) {
       // with none, the id is the honest stand-in.
       headers.set("model-name", encodeURIComponent(modelDisplayName(model, context.state) || model))
     }
-    const messageId = newMessageId()
-    headers.set("user-msg-id", messageId)
-    headers.set("x-message-id", messageId)
+    // One id per user message, repeated for every request that message's turn
+    // sends.
+    headers.set("user-msg-id", turn.messageId)
     headers.set("created-time", new Date().toISOString().replace(/\.\d{3}Z$/, "Z"))
     const ip = clientIp()
     if (ip) headers.set("client-ip", ip)
-    // The rest of the kernel's chat identity (measured [header-debug] full
-    // headers, 2026-11-18): the capability it announces, the session affinity
-    // it forwards, the flag that this request carries a user message, and its
-    // own User-Agent — `opencode/<kernel build>`, not a browser's.
-    if (context.sm4?.enabled) headers.set("X-Encrypt-Capable", SM4_ALGO)
-    headers.set("x-session-affinity", sessionId)
-    headers.set("x-session-user-message", "true")
+    // Its own User-Agent: `opencode/<kernel build>`, not a browser's. This one is
+    // the transport's default in the real client rather than a header it builds,
+    // which is why it is the only one of the SDK's own left standing.
     const kernel = kernelVersion()
     if (kernel) headers.set("User-Agent", `opencode/${kernel}`)
+    // And nothing else of the `x-…` family. The kernel's provider rebuilds its
+    // request from a whitelist, so a header it does not list is never sent — not
+    // the SDK's `x-session-affinity`/`x-message-id`, and not one a host or an
+    // older build of this plugin added. Only the names above go on the wire.
+    if (chat) pruneChatHeaders(headers)
   }
   const send = async () => {
     // 26.11.200 seals the chat body: negotiate an SM4 key, seal the JSON, send
@@ -2802,7 +3104,17 @@ async function signedFetch(cred, input, init, context) {
     let outBody = body
     let outContentType
     let sealInfo = null
-    if (isSealedChatUrl(url, context.sm4) && body.length > 0) {
+    // A request that names no version reads as an older client, and the older
+    // client (26.11.100) did not seal: sealing anyway is the one combination no
+    // real build ever sends. So the seal follows the version — none claimed, none
+    // applied — and the reason is said once, like the other sealing outcomes.
+    const wouldSeal = isSealedChatUrl(url, context.sm4) && body.length > 0
+    const sealable = wouldSeal && !!version
+    if (wouldSeal && !version && !context.sm4.reported) {
+      context.sm4.reported = true
+      context.log?.("CodeArts: the IDE version could not be read, so chats go out plaintext (sealing is a 26.11.200 behaviour)")
+    }
+    if (sealable) {
       try {
         const base = `${new URL(url).protocol}//${new URL(url).host}`
         const keyInfo = await context.sm4.negotiator.getKey(base, (payload) => exchangeSessionKey(base, payload, active, context.fetcher))
@@ -2853,31 +3165,39 @@ async function signedFetch(cred, input, init, context) {
       ...init,
       method,
       headers,
-      ...(outBody.length > 0 ? { body: outBody } : {}),
+      // After the caller's init: a body the caller handed over as a stream has
+      // already been read, so the original must never be handed on again.
+      body: outBody.length > 0 ? outBody : undefined,
       ...(signal ? { signal } : {}),
       // After the caller's init, so no caller turns it back on.
       redirect: "error",
     })
     // A sealed request gets a sealed answer: decrypt the SSE chunks before any
     // caller sees them (and drop the X-Encrypt-* headers the client also drops).
-    lastSeal = sealInfo
-    // The client's own recovery: a sealed request the gateway refused (often a
-    // server-side key expiry) clears the cached key, retries once, and then
-    // gives up on sealing and sends the same body as plaintext.
     if (sealInfo && (res.status < 200 || res.status >= 300)) {
-      void res.body?.cancel().catch(() => {})
+      // The client's own recovery: a sealed request the gateway refused (often a
+      // server-side key expiry) clears the cached key, retries once, and then
+      // gives up on sealing and sends the same body as plaintext.
+      //
+      // But only when the seal is what was refused. A session cap (any `TM.*`
+      // code), a queue answer, a spent quota or a server fault is about the
+      // account or the server: retrying as plaintext would spend a second request
+      // on an account that is already at its limit, and drop a key that still
+      // works — so the next chat would pay a key exchange for nothing. Those
+      // answers go on as they came.
+      const said = await res.text().catch(() => "")
+      if (!sealBlamed(res.status, res.headers, said)) return rebuildResponse(res, said)
       context.sm4.negotiator.forget(urlBase, sealInfo.keyId)
       const retry = await signFor(active, method, url, body, extra)
       const plainHeaders = new Headers(baseHeaders)
       plainHeaders.delete("content-length")
       retry.forEach((value, key) => plainHeaders.set(key, value))
       applyChatHeaders(plainHeaders)
-      lastSeal = null
       return context.fetcher(url, {
         ...init,
         method,
         headers: plainHeaders,
-        ...(body.length > 0 ? { body } : {}),
+        body: body.length > 0 ? body : undefined,
         ...(signal ? { signal } : {}),
         redirect: "error",
       })
@@ -3113,16 +3433,35 @@ const PACKAGE_TYPE_METRICS = {
 }
 
 /**
+ * A route the gateway no longer publishes: `404 APIG.0101 "The API does not
+ * exist or has not been published in the environment"`. Measured 2026-11-21 for
+ * both credit-batch reads — the console's 「获取明细」 is served by the portal
+ * web app now, and the client never asks these paths. Asking again cannot help,
+ * so the account remembers it and the usage card stops paying for a dead route.
+ */
+const RETIRED_ROUTE = /APIG\.0101|does not exist or has not been published/i
+/** What fetchCreditBatches() answers when the gateway retired every route it knows. */
+const CREDIT_BATCHES_RETIRED = Symbol("credit-batches-retired")
+
+/**
  * Every credit batch the account holds, as `{ metric, amount, left, expiresAt }`
  * (`metric` the statistics bucket it counts in, `expiresAt` ms): the packages
  * from `package/credit/page`, and each campaign's grants from `ops/credit`.
- * Undefined when none of it could be read.
+ * `CREDIT_BATCHES_RETIRED` when the gateway no longer publishes those routes,
+ * otherwise undefined when none of it could be read.
  */
 async function fetchCreditBatches(cred, fetcher) {
   const batches = []
   let reached = false
+  let tried = 0
+  let retired = 0
+  const note = (r) => {
+    tried += 1
+    if (!r.ok && RETIRED_ROUTE.test(String(r.message ?? ""))) retired += 1
+  }
   for (const query of PACKAGE_CREDIT_QUERIES) {
     const r = await snapRequest("POST", PACKAGE_CREDIT_PAGE_URL, cred, fetcher, query)
+    note(r)
     const list = asRecord(r.data).list
     if (!r.ok || !Array.isArray(list)) continue
     reached = true
@@ -3134,6 +3473,7 @@ async function fetchCreditBatches(cred, fetcher) {
     }
   }
   const overview = await snapRequest("GET", OPS_CREDIT_OVERVIEW_URL, cred, fetcher)
+  note(overview)
   const campaigns = asRecord(overview.data).items
   if (overview.ok && Array.isArray(campaigns)) {
     reached = true
@@ -3152,6 +3492,9 @@ async function fetchCreditBatches(cred, fetcher) {
       }
     }
   }
+  // Every route the gateway publishes answered "not published": the whole read
+  // is retired, and the account stops asking for it.
+  if (!reached && tried > 0 && retired === tried) return CREDIT_BATCHES_RETIRED
   return reached ? batches : undefined
 }
 
@@ -3205,32 +3548,57 @@ const LEDGER_KEEP_DAYS = 40
 const defaultLedgerPath = () =>
   process.env.MAGPIE_CODEARTS_LEDGER || path.join(os.homedir(), ".config", "magpie", "codearts-checkins.json")
 
+/**
+ * The ledger as an object, `null` when it exists but cannot be read.
+ *
+ * The difference matters: `{}` means "no ledger yet" and is safe to write over,
+ * while a file that exists and does not parse (a half-written one, or one an
+ * antivirus has locked for a moment) must never be written over — that would
+ * drop every account's check-ins the plugin has not yet read.
+ */
 function readLedger(file) {
+  let text
   try {
-    const raw = safeJson(fs.readFileSync(file, "utf8"))
-    return raw && !Array.isArray(raw) ? raw : {}
-  } catch {
-    return {}
+    text = fs.readFileSync(file, "utf8")
+  } catch (e) {
+    return e?.code === "ENOENT" ? {} : null
   }
+  if (!text.trim()) return {}
+  const raw = safeJson(text)
+  return raw && !Array.isArray(raw) ? raw : null
 }
 
 /** The check-in credits the plugin claimed for `account`. */
 function readGrants(file, account) {
-  const list = readLedger(file)[account]
+  const list = (readLedger(file) ?? {})[account]
   return Array.isArray(list) ? list : []
 }
 
 function writeLedger(file, all) {
   fs.mkdirSync(path.dirname(file), { recursive: true })
-  const tmp = `${file}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(all, null, 2))
-  fs.renameSync(tmp, file)
+  const tmp = `${file}.${process.pid}.${Math.random().toString(16).slice(2, 10)}.tmp`
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(all, null, 2))
+    fs.renameSync(tmp, file)
+  } catch (e) {
+    // A rename that failed (the target locked, say) leaves the temp behind: it is
+    // ours, so it goes with the failure rather than accumulating one per attempt.
+    try {
+      fs.rmSync(tmp, { force: true })
+    } catch {
+      /* nothing left to remove */
+    }
+    throw e
+  }
 }
 
 /** Keep one claim (one a Beijing day), dropping what lapsed long ago. */
 function recordGrant(file, account, grant) {
   try {
     const all = readLedger(file)
+    // Unreadable right now: the claim is not lost (it is still in the caller's
+    // memory), and the file keeps every account's history for a later write.
+    if (!all) return
     const keep = Date.now() - LEDGER_KEEP_DAYS * 86_400_000
     const day = beijingDay(vendorDate(grant.at))
     const list = (Array.isArray(all[account]) ? all[account] : [])
@@ -3254,7 +3622,8 @@ const UNCONFIRMED = "_unconfirmed"
 
 /** Today's claims this plugin left unconfirmed for `account`, if any. */
 function readUnconfirmed(file, account) {
-  const left = asRecord(asRecord(readLedger(file)[UNCONFIRMED])[account])
+  const all = readLedger(file) ?? {}
+  const left = asRecord(asRecord(all[UNCONFIRMED])[account])
   if (left.day !== beijingDay()) return []
   if (Array.isArray(left.claims)) return left.claims
   return left.campaignId !== undefined ? [left] : []
@@ -3264,6 +3633,7 @@ function readUnconfirmed(file, account) {
 function recordUnconfirmed(file, account, claims) {
   try {
     const all = readLedger(file)
+    if (!all) return
     const today = beijingDay()
     const kept = Object.fromEntries(
       Object.entries(asRecord(all[UNCONFIRMED])).filter(([k, v]) => k !== account && asRecord(v).day === today),
@@ -4122,7 +4492,7 @@ async function renewFromIde(cred, read) {
     throw new Error("CodeArts: CodeArts Agent hasn't renewed its sign-in yet; open CodeArts Agent on this machine")
   }
   // The account's own fields outlive the credential: its session and name.
-  const kept = Object.fromEntries(["session_id", "user_name", "user_id", "user_phone"].filter((k) => cred[k]).map((k) => [k, cred[k]]))
+  const kept = Object.fromEntries(["session_id", "user_name", "user_id", "user_phone", "record_key"].filter((k) => cred[k]).map((k) => [k, cred[k]]))
   return { ...next, ...kept }
 }
 
@@ -4170,6 +4540,11 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   // plaintext fallback looks exactly like success. One object, shared by every
   // loader this process runs.
   const sm4Context = { enabled: sm4Enabled, negotiator: keyNegotiator, reported: false }
+  // A pinned client version: `clientVersion: ""` claims none (which also turns the
+  // seal off), `clientVersion: "26.11.200"` claims a build this host cannot be
+  // asked for. Undefined leaves it to the installed IDE (see clientVersion()).
+  const pinnedVersion = typeof options?.clientVersion === "string" ? options.clientVersion : undefined
+  const versionOf = () => (pinnedVersion !== undefined ? pinnedVersion : clientVersion())
 
   // Per account, shared by every loader this process runs for it and by
   // nothing else: the gate; its free models today (null until its
@@ -4186,7 +4561,13 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         // model id -> the display name the account's own list gave it, so
         // `model-name` can carry the name the kernel would send.
         modelNames: new Map(),
-        claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0,
+        // turn key -> the trace id and user-message id that turn goes out under,
+        // so a tool loop repeats them the way the real kernel does.
+        turns: new Map(),
+        // conversation -> the turn it last ran, so a history compacted mid-turn
+        // is recognised as the same turn rather than taking new ids.
+        lastTurn: new Map(),
+        claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0, batchesRetired: false,
         renewing: null, renewed: null, unconfirmed: null,
       })
     }
@@ -4324,6 +4705,15 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
             // record hands the other one a credential that still has it.
             const withMaas = mainland ? await withOfficeAceMaas(identified, fetcher) : identified
             const identity = accountIdentityOf(withMaas)
+            // This sign-in writes this card's record only. A Huawei Cloud
+            // refresh token is spent once, so two records holding one
+            // token would sign each other out; the other card has its own
+            // sign-in and its own token.
+            //
+            // Written before the record is built: the write stamps the record's
+            // key onto the credential (`record_key`), and a later renewal writes
+            // back to that key rather than to the provider's bare name.
+            await writeProviderRecord(client, PROVIDER, withMaas, fetcher)
             // `accountId` is the account's identity — the URN, as main
             // gives it — so a re-sign-in replaces the account instead of
             // adding a `codearts#xxxxxx`; `uid` is that same URN.
@@ -4335,11 +4725,6 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
               accountId: identity.id,
               ...(identity.id ? { uid: identity.id } : {}),
             }
-            // This sign-in writes this card's record only. A Huawei Cloud
-            // refresh token is spent once, so two records holding one
-            // token would sign each other out; the other card has its own
-            // sign-in and its own token.
-            await writeProviderRecord(client, PROVIDER, withMaas, fetcher)
             return record
           } catch (e) {
             return { type: "failed", error: e?.message ?? String(e) }
@@ -4550,6 +4935,9 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           // SM4-GCM sealing of the chat body (26.11.200), with one negotiator
           // for every account: keys are cached per base URL.
           sm4: sm4Context,
+          // The IDE version this account's requests claim, resolved once per
+          // request: the seal follows it (see signedFetch).
+          versionOf,
           log,
           renewCredential,
           signInDead: () => signInDead,
@@ -4583,9 +4971,13 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           // Each batch's own expiry, read again every ten minutes (and after a
           // check-in); a failed read keeps the last one, else the ledger stands in.
           // The international station's plans are metered in tokens: no batches.
-          if (station === STATIONS.mainland && (!state.batchesAt || Date.now() - state.batchesAt > CREDIT_BATCHES_TTL_MS)) {
+          // The gateway retired the batch routes (2026-11-21) and asking a dead
+          // route costs a round trip per refresh: one "not published" settles it
+          // for the account, and the card goes on with the ledger and end_date.
+          if (station === STATIONS.mainland && !state.batchesRetired && (!state.batchesAt || Date.now() - state.batchesAt > CREDIT_BATCHES_TTL_MS)) {
             const read = await fetchCreditBatches(cred, fetcher).catch(() => undefined)
-            if (read) state.batches = read
+            if (read === CREDIT_BATCHES_RETIRED) state.batchesRetired = true
+            else if (read) state.batches = read
             state.batchesAt = Date.now()
           }
           const usage = usageFromStatistics(safeJson(text), benefitText === undefined ? undefined : safeJson(benefitText), {
@@ -4695,8 +5087,10 @@ async function persistCredential(client, account, cred) {
     ...(accountId ? { accountId } : {}),
     ...(uid ? { uid } : {}),
   }
+  const key = recordKeyToWrite(cred, PROVIDER)
+  if (!key) return body
   try {
-    await client?.auth?.set?.({ path: { id: PROVIDER }, body })
+    await client?.auth?.set?.({ path: { id: key }, body })
   } catch {
     /* best effort */
   }
@@ -4712,12 +5106,13 @@ export const _internal = {
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, upstreamModelId, formatCredit,
   DEFAULT_LOCALE, LOCALE_ENV, codeartsLocale,
   CLIENT_TYPE, CLIENT_PLUGIN_NAME, CLIENT_IDE_NAME, CLIENT_VERSION_ENV, IDE_DIR_ENV, ideInstallDir, ideVersionFromKernel,
-  CLIENT_IP_ENV, clientVersion, clientIp, kernelVersion, KERNEL_VERSION_ENV, CHAT_OT_FUNCTION, modelDisplayName, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
+  CLIENT_IP_ENV, clientVersion, clientIp, PRIVATE_IPV4, kernelVersion, KERNEL_VERSION_ENV, CHAT_OT_FUNCTION, modelDisplayName, CONVERSATION_HEADER, derivedSessionId, createSessionPool,
   b64url, utf8, sha256Hex, hmacSha256Hex,
   generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
   // 26.11.200 sm4-gcm transport encryption
-  sm4GcmSeal, sm4GcmOpen, createKeyNegotiator, isSealedChatUrl, exchangeSessionKey, sessionIdFromDigest, SESSION_ID_PREFIX, newMessageId,
-  decryptSealedResponse, KEY_EXCHANGE_PATH, SM4_ALGO,
+  sm4GcmSeal, sm4GcmOpen, createKeyNegotiator, isSealedChatUrl, exchangeSessionKey, sessionIdFromDigest, SESSION_ID_PREFIX, MESSAGE_ID_PREFIX, kernelId, idHead, sessionHead, newMessageId, turnKeyOf, turnIdsOf,
+  decryptSealedResponse, KEY_EXCHANGE_PATH, SM4_ALGO, SM4_IV_BYTES, SM4_TAG_BYTES,
+  sealBlamed, pruneChatHeaders, CHAT_X_HEADERS, pollSeconds,
   buildCanonicalRequest, signRequestHuawei,
   credentialFromTokenResponse, credentialOf, expiresFromCredential, accountIdentityOf, accountSessionIds,
   profileOf, looksLikeIdentifier, maskPhone, fetchAccountPhone, accountPhoneField, IAM_HOST, IAM_USER_URL,
@@ -4729,6 +5124,7 @@ export const _internal = {
   canonicalQuery, beijingDay, nextBeijingMidnight, vendorDate, creditRateOf,
   claimBenefit, ensureBenefitClaimed, parseAgentModel, fetchAgentModels,
   readGrants, recordGrant, readUnconfirmed, recordUnconfirmed, grantExpiry, grantBatches, soonestLapse, bucketLapse, fetchCreditBatches,
+  RETIRED_ROUTE, CREDIT_BATCHES_RETIRED,
   PACKAGE_CREDIT_PAGE_URL, OPS_CREDIT_OVERVIEW_URL, OPS_CREDIT_CAMPAIGN_URL,
   toBytes, isBenefitModel, prepareChatBody, signedFetch, signedGet,
   TOOL_NAME_LIMIT, cutToolName, shortenToolNames, lastUserPrompt, restoreToolNames, restoreToolNamesInStream,
@@ -4795,6 +5191,11 @@ const OA_RATES_TTL_MS = 20 * 60 * 1000
 const OA_RATES_RETRY_MS = 400
 const OA_REFRESH_LEAD_MS = 10 * 60 * 1000
 const OA_TOKEN_TIMEOUT_MS = 30_000
+// A chat's own bound: the token read above must not outlast a slow vendor, but a
+// streamed answer can legitimately run for minutes, so the chat is bounded well
+// past that. An `AbortSignal.timeout` covers the whole request including its
+// streamed body, not just the wait for the headers.
+const OA_CHAT_TIMEOUT_MS = 10 * 60 * 1000
 
 /**
  * The models shown before a sign-in, and while an account's rates table has
@@ -4876,6 +5277,7 @@ function officeAceCredentialOf(auth) {
     model_app_key: pick(flat.model_app_key, flat.modelAppKey),
     model_app_secret: pick(flat.model_app_secret, flat.modelAppSecret),
     maas_base_url: pick(flat.maas_base_url, flat.maasBaseUrl),
+    record_key: pick(flat.record_key, flat.recordKey),
     oauth_client: pick(flat.oauth_client, flat.oauthClient, codeArtsShape ? "codearts-agent" : OA_AGENTARTS_CLIENT_ID),
   }
 }
@@ -4905,6 +5307,7 @@ function officeAceCredentialRecord(cred) {
     // A record written from a credential with no marker of its own is one this
     // package's CodeArts sign-in (or a rotation of it) issued.
     oauth_client: firstOf(cred.oauth_client, "codearts-agent"),
+    record_key: firstOf(cred.record_key),
     ...(identity.id ? { uid: identity.id } : {}),
   }
 }
@@ -5020,8 +5423,8 @@ function signOfficeAceV11(urlStr, cred, method = "GET", body, dateOverride) {
 
 /** One signed OfficeAce request; a network error is `status: 0` with its reason. */
 async function officeAceSigned(cred, urlStr, method = "GET", body, fetcher = fetch) {
-  const headers = signOfficeAceV11(urlStr, cred, method, body)
   try {
+    const headers = signOfficeAceV11(urlStr, cred, method, body)
     const res = await fetcher(urlStr, {
       method,
       headers,
@@ -5074,7 +5477,10 @@ async function officeAceMaasInfo(cred, fetcher = fetch) {
   const hit = oaMaasCache.get(identity)
   if (hit && Date.now() - hit.at < 6 * 60 * 60 * 1000) return hit.info
   const info = await fetchOfficeAceMaasInfo(cred, fetcher).catch(() => null)
-  if (info) oaMaasCache.set(identity, { at: Date.now(), info })
+  // Only a pair is remembered. An answer without one means "MaaS not opened yet",
+  // and the user may open it a minute later: caching that for six hours would leave
+  // the card saying "MaaSNotLinked" until the host restarted.
+  if (info?.model_app_key) oaMaasCache.set(identity, { at: Date.now(), info })
   return info
 }
 
@@ -5097,7 +5503,8 @@ async function fetchOfficeAceTokenRates(cred, fetcher = fetch) {
   const hit = oaRatesCache.get(identity)
   if (hit && hit.map.size > 0 && Date.now() - hit.at < OA_RATES_TTL_MS) return hit.map
   const keepStale = () => {
-    if (hit) oaRatesCache.set(identity, { at: Date.now(), map: hit.map })
+    // The old timestamp stands: restamping it would push the retry out by another
+    // TTL every time, and a stale "billable" list would outlive the reason for it.
     return hit?.map ?? new Map()
   }
 
@@ -5450,12 +5857,18 @@ async function officeAceChatFetch({ input, init, credential, renew, fetcher = fe
   if (body === undefined && req) body = await req.text()
   body = officeAceStripPrefix(body)
   const target = `${officeAceMaasBase(credential)}${OA_CHAT_PATH}`
-  const signal = init?.signal ?? req?.signal ?? AbortSignal.timeout(OA_TOKEN_TIMEOUT_MS)
+  // The caller's own bound wins; with none, the chat gets a long one of its own
+// rather than the token read's 30 s, which would cut a streamed answer off.
+  const signal = init?.signal ?? req?.signal ?? AbortSignal.timeout(OA_CHAT_TIMEOUT_MS)
 
+  // The host's headers go along: `x-officeace-session` (this provider's own
+  // `chat.headers` mark) and anything else the caller set. The two that must be
+  // ours are written last.
+  const callerHeaders = Object.fromEntries(new Headers(init?.headers ?? req?.headers).entries())
   const call = (cred) =>
     fetcher(target, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: basicAuthorization(cred) },
+      headers: { ...callerHeaders, "content-type": "application/json", authorization: basicAuthorization(cred) },
       body,
       signal,
     })
@@ -5542,8 +5955,6 @@ const seenProviderAccounts = new Map()
 const renewalGates = new Map()
 /** refresh token → the lineage it belongs to (a rotation keeps its parent's). */
 const refreshLineages = new Map()
-/** How long a spent token's renewal stands in for it. */
-const CHAIN_LIVE_MS = 10 * 60 * 1000
 /** How many token lineages are remembered: one per rotation, oldest dropped. */
 const LINEAGE_CAP = 1024
 
@@ -5646,16 +6057,42 @@ async function withOfficeAceMaas(cred, fetcher = fetch) {
 }
 
 /**
+ * The key a record's renewal may write back to, or "" when it must not.
+ *
+ * The host keys a record by the provider name, and this package's own sign-ins
+ * stamp their key on the credential as `record_key`. A credential without one is
+ * an account the host wrote itself, or one written before the stamp existed: the
+ * bare provider name is only safe when this account is the provider's only one.
+ * Where another account is known, writing the bare name would land on whichever
+ * record sits there — another account's, credentials and all — so the write is
+ * skipped instead, and the host's own renewal keeps it.
+ */
+function recordKeyToWrite(cred, provider) {
+  const stamped = firstOf(cred?.record_key)
+  if (stamped) return stamped
+  const known = seenProviderAccounts.get(provider)
+  if (!known) return provider
+  const identity = accountIdentityOf(cred).id
+  return known.size === 1 && known.has(identity) ? provider : ""
+}
+
+/**
  * Write one account's record under `target`, in that provider's own shape.
  * Used at a sign-in, so the card that signed in keeps its record where a later
  * renewal can find it again. Only ever called for the card's own provider:
  * writing one sign-in into two records is what `STS5.1806` was about.
+ *
+ * The key is stamped on the credential as `record_key`, and that is what every
+ * later write of it uses (see persistCredential): the host keys records by the
+ * provider name, so an in-band renewal that wrote the bare name would land on
+ * whichever record sits there — the first account's, overwriting it.
  */
 async function writeProviderRecord(client, target, cred, fetcher = fetch) {
   const identity = accountIdentityOf(cred).id
   if (!identity || !client?.auth?.set) return null
   const key = recordKeyFor(target, identity)
   if (!key) return null
+  cred.record_key = key
   const body = target === OFFICEACE_PROVIDER
     ? officeAceRecordBody(await withOfficeAceMaas(cred, fetcher))
     : codeArtsRecordBody(cred)
@@ -5687,7 +6124,7 @@ function renewSharedCredential(cred, run, client = refreshClientOf(cred)) {
     .then((next) => {
       // A rotation rebuilds only the STS half of a credential: what the account
       // carries besides it (its MaaS pair, its phone, its session) stays.
-      for (const k of ["model_app_key", "model_app_secret", "maas_base_url", "user_phone", "domain_id", "oauth_client"]) {
+      for (const k of ["model_app_key", "model_app_secret", "maas_base_url", "user_phone", "domain_id", "oauth_client", "record_key"]) {
         if (cred[k] && !next[k]) next[k] = cred[k]
       }
       // The new token belongs to the same chain: a record still holding the
@@ -5733,7 +6170,7 @@ async function renewOfficeAceCredential(cred, fetcher = fetch) {
   const next = credentialFromTokenResponse(token, firstOf(cred.code_verifier), keyPair)
   // What a rotation does not rebuild: the account's one upstream session, its
   // identity, its phone and the MaaS credentials behind the preserved appKey.
-  for (const k of ["session_id", "domain_id", "user_phone", "model_app_key", "model_app_secret", "maas_base_url", "oauth_client"]) {
+  for (const k of ["session_id", "domain_id", "user_phone", "model_app_key", "model_app_secret", "maas_base_url", "oauth_client", "record_key"]) {
     if (cred[k]) next[k] = cred[k]
   }
   if (!next.refresh_token) next.refresh_token = cred.refresh_token
@@ -5778,8 +6215,10 @@ async function persistOfficeAceRecord(client, cred, prev) {
     ...(accountId ? { accountId } : {}),
     ...(uid ? { uid } : {}),
   }
+  const key = recordKeyToWrite(cred, OFFICEACE_PROVIDER)
+  if (!key) return record
   try {
-    await client?.auth?.set?.({ path: { id: OFFICEACE_PROVIDER }, body: record })
+    await client?.auth?.set?.({ path: { id: key }, body: record })
   } catch {
     /* best effort: the next renewal writes it again */
   }
@@ -6031,7 +6470,14 @@ export const OfficeAceAuthPlugin = async ({ client } = {}, options = {}) => {
             windows: u.windows,
           }
         } catch (e) {
-          return { error: String(e?.message ?? e).slice(0, 300), windows: [] }
+          const said = String(e?.message ?? e)
+          // The subscription read is signed with the STS triple: a 401/403 there is
+          // the credential, not the network. Saying so lets the host mark the
+          // account instead of showing an error forever.
+          if (/HTTP (401|403)\b/.test(said)) {
+            return { error: "OfficeAce 登录已失效，请重新登录", windows: [], signIn: "expired" }
+          }
+          return { error: said.slice(0, 300), windows: [] }
         }
       },
 

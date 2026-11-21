@@ -25,13 +25,22 @@ const CodeArtsAuthPlugin = (ctx, opts = {}) => CodeArtsAuthPluginRaw(ctx, { sm4:
 
 // The record-key file lives beside the check-in ledger; a test must never write
 // the real ~/.config (a fresh CI home hides this, a developer's does not).
-process.env.MAGPIE_CODEARTS_RECORDS = path.join(os.tmpdir(), `codearts-records-test-${process.pid}.json`)
+const recordsFile = path.join(os.tmpdir(), `codearts-records-test-${process.pid}.json`)
+process.env.MAGPIE_CODEARTS_RECORDS = recordsFile
 
 // Never the real ledger in ~/.config/magpie: every plugin made here keeps its
 // check-ins in a scratch file of its own.
 const ledgerDir = fs.mkdtempSync(path.join(os.tmpdir(), "codearts-ledger-"))
 process.env.MAGPIE_CODEARTS_LEDGER = path.join(ledgerDir, "default.json")
-test.after(() => fs.rmSync(ledgerDir, { recursive: true, force: true }))
+test.after(() => {
+  fs.rmSync(ledgerDir, { recursive: true, force: true })
+  // The records file is written by the OfficeAce tests; nothing else owns it.
+  try {
+    fs.rmSync(recordsFile, { force: true })
+  } catch {
+    /* best effort */
+  }
+})
 
 // Never the real CodeArts Agent's state.vscdb: a plugin made here without an
 // `ideStateFile` of its own looks at a file that isn't there.
@@ -495,10 +504,10 @@ test("accountSessionIds is stable per account and differs between accounts", asy
   const a = await x.accountSessionIds({ session_id: "s1", access_key_id: "AK1" })
   assert.deepEqual(await x.accountSessionIds({ session_id: "s1", access_key_id: "AK2" }), a)
   assert.notDeepEqual(await x.accountSessionIds({ session_id: "s2", access_key_id: "AK1" }), a)
-  assert.match(a.sessionId, /^ses_[A-Za-z0-9]{24}$/)
+  assert.match(a.sessionId, /^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
   // Since 0.3.25 the account id is `accountSessionId`; `chatId` is gone (one
   // conversation gets its own session from the pool instead).
-  assert.match(a.accountSessionId, /^ses_[A-Za-z0-9]{24}$/)
+  assert.match(a.accountSessionId, /^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
   assert.equal(a.chatId, undefined)
 })
 
@@ -801,6 +810,48 @@ test("fetchCreditBatches reads every batch with its own expiry, signed", async (
   assert.equal(await x.fetchCreditBatches({ access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }, async () => new Response("", { status: 401 })), undefined)
 })
 
+test("a retired credit-batch route is reported once, so the card stops asking", async () => {
+  // The gateway stopped publishing both reads (measured 2026-11-21).
+  const gone = async () => new Response(
+    JSON.stringify({ error_msg: "The API does not exist or has not been published in the environment", error_code: "APIG.0101" }),
+    { status: 404, headers: { "content-type": "application/json" } },
+  )
+  const cred = { access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }
+  assert.equal(await x.fetchCreditBatches(cred, gone), x.CREDIT_BATCHES_RETIRED)
+  // One route answering is enough to keep reading the other.
+  const halfGone = async (url) => String(url).includes("credit/page")
+    ? new Response(JSON.stringify({ code: 0, data: { list: [] } }), { status: 200 })
+    : gone()
+  assert.deepEqual(await x.fetchCreditBatches(cred, halfGone), [])
+  // A plain failure is not a retirement: it is tried again next time.
+  const broken = async () => new Response("", { status: 502 })
+  assert.equal(await x.fetchCreditBatches(cred, broken), undefined)
+})
+
+test("usage asks a retired route once, then stops", async () => {
+  // The card's own behaviour: one "not published" settles the account, so the next
+  // usage read costs nothing on that route.
+  let creditCalls = 0
+  const fetcher = async (url) => {
+    const u = String(url)
+    if (u.includes("statistics/plugin")) return new Response(JSON.stringify({ metrics: [], end_date: "2099-01-01" }), { status: 200 })
+    if (u.includes("credit/page") || u.includes("ops/credit")) {
+      creditCalls += 1
+      return new Response(JSON.stringify({ error_msg: "The API does not exist or has not been published", error_code: "APIG.0101" }), { status: 404 })
+    }
+    return new Response("{}", { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const cred = await makeCred()
+  const auth = async () => makeAuth(cred)
+  await plugin.auth.usage(auth)
+  const afterFirst = creditCalls
+  assert.ok(afterFirst > 0, "the first read asks")
+  await new Promise((r) => setTimeout(r, 10))
+  await plugin.auth.usage(auth)
+  assert.equal(creditCalls, afterFirst, "the second read asks nothing: the route is retired")
+})
+
 test("usage with the vendor's batches: the plan's end is the reset, the grants' the lapse", async () => {
   const cred = await makeCred()
   const { fetcher: credit, planEnd, signUp } = creditFetcher()
@@ -995,7 +1046,7 @@ test("loader signs each chat request with SDK-HMAC-SHA256 and sends it metered",
   assert.equal(headers.has("lang"), false)
   assert.equal(headers.has("chat-id"), false)
   assert.equal(headers.has("session-id"), false)
-  assert.match(headers.get("x-ot-session-id"), /^ses_[A-Za-z0-9]{24}$/)
+  assert.match(headers.get("x-ot-session-id"), /^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
   assert.equal(headers.has("maas_type"), false)
   // The body signed and sent: bare model, explicit thinking, streamed.
   assert.deepEqual(JSON.parse(new TextDecoder().decode(seen[0].init.body)), {
@@ -1024,7 +1075,7 @@ test("sessions key on x-ot-session-id; no Chat-Id/Session-Id is sent (0.3.25)", 
   await (await b.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
   // Every request carries an x-ot-session-id and never the removed headers.
   for (const h of seen) {
-    assert.match(h.get("x-ot-session-id"), /^ses_[A-Za-z0-9]{24}$/)
+    assert.match(h.get("x-ot-session-id"), /^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
     assert.equal(h.has("chat-id"), false)
     assert.equal(h.has("session-id"), false)
   }
@@ -1354,7 +1405,7 @@ test("embeddedErrorStatus sorts the gateway's codes into what magpie acts on", (
   assert.equal(x.embeddedErrorStatus("InferHub.001001020.406"), 400)
 })
 
-test("every chat carries the agent's session headers: one session, a fresh trace", async () => {
+test("every chat carries the agent's session headers: one session, and a request with no turn stands alone", async () => {
   const cred = await makeCred()
   const seen = []
   const plugin = await CodeArtsAuthPlugin({ client: {} }, {
@@ -1367,9 +1418,12 @@ test("every chat carries the agent's session headers: one session, a fresh trace
   await (await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
   await (await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))).text()
   const [a, b] = seen
-  assert.match(a.get("x-ot-session-id"), /^ses_[A-Za-z0-9]{24}$/)
+  assert.match(a.get("x-ot-session-id"), /^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
   assert.equal(a.get("x-ot-session-id"), b.get("x-ot-session-id"))
   assert.equal(a.get("user-session-id"), a.get("x-ot-session-id"))
+  // Neither body carries a user turn, so neither names one: the two requests are
+  // not one turn, and each gets its own trace (a turn's is shared — see the
+  // turnIdsOf test below).
   assert.notEqual(a.get("x-ot-trace-id"), b.get("x-ot-trace-id"))
   assert.notEqual(a.get("x-snap-traceid"), b.get("x-snap-traceid"))
 })
@@ -1574,7 +1628,9 @@ test("a queue poll that hangs can't outlast the wait: the request leaves the que
     }
     return new Response("{}", { status: 429, headers: { "queue-status": "queued", "trace-id": "T3", "retry-after": "0" } })
   }
-  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueBudgetMs: 200 })
+  // The poll is floored at a second (a `retry-after: 0` must not become a poll
+  // flood), so the budget leaves room for one poll before it runs out.
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueBudgetMs: 2_500 })
   const loaded = await plugin.auth.loader(async () => makeAuth(cred))
   const res = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))
   assert.equal(res.status, 429)
@@ -2625,6 +2681,26 @@ test("a contest check-in refused for not having signed up is ineligible, not a f
   assert.deepEqual(claims, [40, 34])
 })
 
+test("an unreadable ledger is never written over: other accounts keep their check-ins", () => {
+  const ledgerPath = path.join(ledgerDir, "unreadable.json")
+  // A half-written file, or one an antivirus has locked for a moment: it exists,
+  // and it is not ours to replace.
+  const broken = '{"acctA": [{"at": "2026-11-01T00:00:00Z", "credit"'
+  fs.writeFileSync(ledgerPath, broken)
+  x.recordGrant(ledgerPath, "acctC", { credit: 100, at: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString() })
+  assert.equal(fs.readFileSync(ledgerPath, "utf8"), broken, "the file it could not read is left alone")
+  assert.deepEqual(x.readGrants(ledgerPath, "acctA"), [], "and nothing is invented from it")
+
+  // A ledger that does not exist yet is written as usual.
+  const fresh = path.join(ledgerDir, "fresh.json")
+  x.recordGrant(fresh, "acctC", { credit: 100, at: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString() })
+  assert.equal(x.readGrants(fresh, "acctC").length, 1)
+  // ... and an empty one is "no entries yet", not "unreadable".
+  fs.writeFileSync(fresh, "")
+  x.recordGrant(fresh, "acctD", { credit: 5, at: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString() })
+  assert.equal(x.readGrants(fresh, "acctD").length, 1)
+})
+
 test("a claimed check-in is kept, and the usage card says when those credits run out", async () => {
   const cred = await makeCred()
   const ledgerPath = path.join(ledgerDir, "integrated.json")
@@ -3106,6 +3182,81 @@ function oaFetcher(answer) {
   }
   return { fetcher, seen }
 }
+
+test("a record is written back to the key its sign-in used, never to another account's slot", async () => {
+  // A sign-in stamps the key it wrote on the credential; a later renewal follows
+  // it. Without the stamp, the bare provider name is only safe while this account
+  // is the provider's only one — with another account known, nothing is written,
+  // because the bare name is where that account sits.
+  const { credential } = await officeAceAuthRecord({}, "iam::d1:user:hw-paid")
+  const cred = oa.officeAceCredentialOf({ access: JSON.stringify(credential) })
+  oa.seenProviderAccounts.clear()
+
+  // 1. stamped: the renewal writes that key
+  const stamped = []
+  await oa.persistOfficeAceRecord(oaClient(stamped), { ...cred, record_key: "officeace#1a2b3c4d" }, {})
+  assert.deepEqual(stamped.map((c) => c.path.id), ["officeace#1a2b3c4d"])
+
+  // 2. no stamp, only this account known: the provider's own key, as before
+  const single = []
+  oa.noteProviderAccount("officeace", x.accountIdentityOf(cred).id)
+  await oa.persistOfficeAceRecord(oaClient(single), cred, {})
+  assert.deepEqual(single.map((c) => c.path.id), ["officeace"])
+
+  // 3. no stamp, another account known: nothing is written — the bare name is
+  //    that account's slot, and writing there would replace its credentials
+  const other = []
+  oa.noteProviderAccount("officeace", "iam::d1:user:someone-else")
+  await oa.persistOfficeAceRecord(oaClient(other), cred, {})
+  assert.deepEqual(other, [], "no write to a slot another account sits at")
+  oa.seenProviderAccounts.clear()
+})
+
+test("a CodeArts renewal keeps the key its record lives at", async () => {
+  const cred = { ...(await makeCred()), record_key: "codearts#deadbeef" }
+  const calls = []
+  await x.persistCredential(oaClient(calls), { accountId: "iam::d:user:hw1" }, cred)
+  assert.deepEqual(calls.map((c) => c.path.id), ["codearts#deadbeef"], "the stamped key, not the bare name")
+  assert.equal(JSON.parse(calls[0].body.access).record_key, "codearts#deadbeef", "the key survives the write")
+
+  // No stamp and another account known: the bare name is that account's slot, so
+  // nothing is written rather than replacing its credentials.
+  const guarded = []
+  oa.seenProviderAccounts.clear()
+  oa.noteProviderAccount(x.PROVIDER, "iam::d:user:someone-else")
+  await x.persistCredential(oaClient(guarded), {}, { ...(await makeCred()) })
+  assert.deepEqual(guarded, [], "no write to a slot another account sits at")
+  oa.seenProviderAccounts.clear()
+
+  // ... and the renewal still hands the credential back to the host, stamped or not.
+  const fetcher = async (url) => (String(url) === x.STS_TOKEN_ENDPOINT
+    ? new Response(stsBody("AK-NEW", "R2"), { status: 200 })
+    : new Response("{}", { status: 200 }))
+  const plugin = await CodeArtsAuthPlugin({ client: oaClient([]) }, { fetch: fetcher })
+  const renewed = await plugin.auth.refresh(makeAuth(cred))
+  assert.equal(JSON.parse(renewed.access).record_key, "codearts#deadbeef")
+})
+
+test("an OfficeAce chat keeps the headers the host handed it", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push({ url: String(url), headers: new Headers(init.headers) })
+    return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+  }
+  await oa.officeAceChatFetch({
+    input: "https://api.modelarts-maas.com/v2/chat/completions",
+    init: { method: "POST", headers: { "x-officeace-session": "ses_host", "x-trace": "t1" }, body: "{}" },
+    credential: { model_app_key: "K", model_app_secret: "S", maas_base_url: "" },
+    fetcher,
+  })
+  const h = seen[0].headers
+  // the provider's own session mark (its `chat.headers` hook) reaches the vendor
+  assert.equal(h.get("x-officeace-session"), "ses_host")
+  assert.equal(h.get("x-trace"), "t1")
+  // and the two that must be ours are ours
+  assert.match(h.get("authorization"), /^Basic /)
+  assert.equal(h.get("content-type"), "application/json")
+})
 
 const oaClient = (calls = []) => ({
   app: { log: async () => {} },
@@ -4575,21 +4726,54 @@ function sqlRun(db, sql, ...params) {
 }
 
 // A state.vscdb as the CodeArts Agent writes it, in a folder of the test's own.
+// Windows keeps a just-closed SQLite file locked for a moment, so a cleanup that
+// fails on EBUSY must not fail the test that has already passed: the removal
+// waits for the lock instead of throwing.
+const pauseSync = (ms) => {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch {
+    /* no shared memory: just try again at once */
+  }
+}
+function removeDir(dir) {
+  for (let tryNo = 0; tryNo < 40; tryNo++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+      return
+    } catch (e) {
+      if (!["EBUSY", "EPERM", "ENOTEMPTY", "EACCES"].includes(e?.code)) return
+      pauseSync(25)
+    }
+  }
+}
+
 async function ideFixture({ value, wal = false, raw } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codearts-ide-test-"))
-  test.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  let db = null
+  test.after(() => {
+    try {
+      db?.close()
+    } catch {
+      /* the caller already closed it */
+    }
+    removeDir(dir)
+  })
   const file = path.join(dir, "state.vscdb")
   if (raw !== undefined) {
     fs.writeFileSync(file, raw)
     return { file, dir }
   }
-  const db = await x.openSqlite(file)
+  db = await x.openSqlite(file)
   if (wal) db.exec("PRAGMA journal_mode=WAL")
   db.exec("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
   sqlRun(db, "INSERT INTO ItemTable (key, value) VALUES (?, ?)", "workbench.other", "{}")
   if (value !== undefined) sqlRun(db, "INSERT INTO ItemTable (key, value) VALUES (?, ?)", x.IDE_STATE_KEY, value)
   // with WAL the connection stays open, so the row is still only in the -wal
-  if (!wal) db.close()
+  if (!wal) {
+    db.close()
+    db = null
+  }
   return { file, dir, db }
 }
 
@@ -4963,18 +5147,28 @@ test("sm4GcmSeal/sm4GcmOpen round-trip, and the keystream matches node's sm4-ctr
   const aad = Buffer.from("POST|/api/v2/chat/completions|1700000000000", "utf8")
   const { ciphertext, authTag, iv: outIv } = x.sm4GcmSeal(key, pt, aad, iv)
   assert.ok(outIv.equals(iv))
-  // The GCM CTR keystream starts at J0+1 = iv||00000002; node's sm4-ctr agrees.
-  const j0 = Buffer.concat([iv, Buffer.from([0, 0, 0, 1])])
-  const ctr = Buffer.from(j0)
-  ctr.writeUInt32BE((ctr.readUInt32BE(12) + 1) >>> 0, 12)
-  const c = crypto.createCipheriv("sm4-ctr", key, ctr)
-  assert.ok(Buffer.concat([c.update(pt), c.final()]).equals(ciphertext))
   // and it opens back
   assert.equal(x.sm4GcmOpen(key, iv, ciphertext, authTag, aad).toString("utf8"), pt.toString("utf8"))
   // a different AAD (or a flipped tag) is refused
   assert.throws(() => x.sm4GcmOpen(key, iv, ciphertext, authTag, Buffer.from("POST|/other|1")), /tag mismatch/)
   const bad = Buffer.from(authTag); bad[0] ^= 1
   assert.throws(() => x.sm4GcmOpen(key, iv, ciphertext, bad, aad), /tag mismatch/)
+  // The GCM CTR keystream starts at J0+1 = iv||00000002, so node's sm4-ctr agrees
+  // — where the runtime has that cipher (Bun's node:crypto build may not).
+  const j0 = Buffer.concat([iv, Buffer.from([0, 0, 0, 1])])
+  const ctr = Buffer.from(j0)
+  ctr.writeUInt32BE((ctr.readUInt32BE(12) + 1) >>> 0, 12)
+  let c
+  try {
+    c = crypto.createCipheriv("sm4-ctr", key, ctr)
+  } catch (e) {
+    if (e?.code === "ERR_CRYPTO_UNKNOWN_CIPHER") {
+      console.log("skipping the sm4-ctr keystream cross-check: this runtime has no sm4-ctr")
+      return
+    }
+    throw e
+  }
+  assert.ok(Buffer.concat([c.update(pt), c.final()]).equals(ciphertext))
 })
 
 test("a sealed chat decrypts as it streams, and the ciphertext never reaches the caller", async () => {
@@ -5095,9 +5289,54 @@ test("a sealed chat the gateway refuses is retried once as plaintext, with the k
   assert.equal(new Headers(chats[0].init.headers).get("X-Encrypt-Algo"), x.SM4_ALGO)
   assert.equal(new Headers(chats[1].init.headers).has("X-Encrypt-Algo"), false, "the retry is plaintext")
   assert.equal(exchanges, 1, "the refused key is not negotiated again")
+  // The refusal dropped the cache: the next chat negotiates a key of its own.
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  assert.equal(exchanges, 2, "the refused key is gone from the cache")
 })
 
-test("chat carries x-message-id equal to user-msg-id, and an encoded model-name (26.11.200)", async () => {
+test("a refusal the seal has nothing to do with is not retried as plaintext", async () => {
+  // Each of these is about the account or the server, not the sealed body: a
+  // plaintext copy would spend a second request on an account already at its
+  // limit, and drop a key that still works (so the next chat pays for a new one).
+  const families = [
+    ["session cap", () => new Response(JSON.stringify({ error_code: "TM.00001041", error_msg: "并发会话数已达上限(3个)" }), { status: 400 })],
+    ["queue", () => new Response("{}", { status: 429, headers: { "queue-status": "queued", "trace-id": "t1", "retry-after": "0" } })],
+    ["spent quota", () => new Response(JSON.stringify({ error_code: "InferHub.4291.200" }), { status: 400 })],
+    ["server fault", () => new Response("boom", { status: 500 })],
+  ]
+  for (const [label, answer] of families) {
+    const ecdh = crypto.createECDH("prime256v1")
+    ecdh.generateKeys()
+    let exchanges = 0
+    const chats = []
+    const fetcher = async (url, init = {}) => {
+      const u = String(url)
+      if (u.includes(x.KEY_EXCHANGE_PATH)) {
+        exchanges += 1
+        return new Response(JSON.stringify({ serverPublicKey: ecdh.getPublicKey().toString("base64"), keyId: "kid-1", expiresIn: 7200 }),
+          { status: 200, headers: { "content-type": "application/json" } })
+      }
+      if (!u.includes("/chat/completions")) return new Response("{}", { status: 200 })
+      chats.push(new Headers(init.headers).has("X-Encrypt-Algo"))
+      return answer()
+    }
+    const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+      fetch: fetcher, sm4: true, retryDelays: [1], retryBudgetMs: 0, queueBudgetMs: 0, clientVersion: "26.11.200",
+    })
+    const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+    const res = await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))
+    await res.text().catch(() => {})
+    assert.equal(chats.length, 1, `${label}: one attempt, no plaintext copy`)
+    assert.equal(chats[0], true, `${label}: the one attempt was sealed`)
+    assert.equal(exchanges, 1, `${label}: the key is kept`)
+    // The key it kept is the one the next chat uses: no second negotiation.
+    const again = await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))
+    await again.text().catch(() => {})
+    assert.equal(exchanges, 1, `${label}: the kept key is reused`)
+  }
+})
+
+test("model-name is the account's display name, percent-encoded, else the id (26.11.200)", async () => {
   const seen = []
   const fetcher = async (url, init = {}) => {
     seen.push(new Headers(init.headers))
@@ -5105,13 +5344,14 @@ test("chat carries x-message-id equal to user-msg-id, and an encoded model-name 
   }
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
   const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  // No list read yet: the id is the honest stand-in, still percent-encoded.
   await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
-  const h = seen[0]
-  assert.match(h.get("x-message-id"), /^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
-  assert.equal(h.get("x-message-id"), h.get("user-msg-id"))
-  assert.equal(h.get("model-name"), encodeURIComponent("GLM-5.2"))
+  assert.equal(seen[0].get("model-name"), encodeURIComponent("GLM-5.2"))
+  // A name carrying a reserved character is encoded on the wire, as the kernel does.
+  assert.equal(encodeURIComponent("DeepSeek V4.1/Flash"), "DeepSeek%20V4.1%2FFlash")
 })
-test("chat carries the kernel's remaining identity headers (X-Encrypt-Capable, session affinity, UA)", async () => {
+
+test("a chat sends only the `x-…` headers the kernel sends, whatever the host added", async () => {
   const seen = []
   const fetcher = async (url, init = {}) => {
     seen.push({ url: String(url), headers: new Headers(init.headers) })
@@ -5119,17 +5359,41 @@ test("chat carries the kernel's remaining identity headers (X-Encrypt-Capable, s
   }
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, sm4: true })
   const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
-  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  // A host (or an older build of this plugin) hands over five headers the kernel
+  // never sends. The provider rebuilds its set from a whitelist, so they would be
+  // dropped there; the plugin must drop them itself.
+  const injected = {
+    ...chatInit({ model: "GLM-5.2", messages: [] }).headers,
+    "x-session-affinity": "ses_host",
+    "x-message-id": "msg_host",
+    "x-session-user-message": "true",
+    "X-Encrypt-Capable": "sm4-gcm",
+    "x-acme-fingerprint": "not-a-kernel-header",
+  }
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", {
+    method: "POST",
+    headers: injected,
+    body: JSON.stringify({ model: "GLM-5.2", messages: [], stream: true }),
+  })).text()
   // sm4 is on, so the first request is the key exchange; the chat is the one after it
   const h = seen.find((s) => s.url.includes("/chat/completions")).headers
-  // the capability the real kernel announces whenever sm4 is on
-  assert.equal(h.get("X-Encrypt-Capable"), x.SM4_ALGO)
-  // session affinity repeats the session id; the request says it carries a user message
-  assert.equal(h.get("x-session-affinity"), h.get("x-ot-session-id"))
-  assert.equal(h.get("x-session-user-message"), "true")
-  // its own User-Agent names the kernel build, never a browser's
-  const ua = h.get("User-Agent")
-  assert.ok(ua === null || /^opencode\/\d+\.\d+\.\d+-\d{14}$/.test(ua), `unexpected UA: ${ua}`)
+  for (const gone of ["x-session-affinity", "x-message-id", "x-session-user-message", "X-Encrypt-Capable", "x-acme-fingerprint"]) {
+    assert.equal(h.has(gone), false, `${gone} is not a header the kernel sends`)
+  }
+  // ... and what it does send is all there.
+  for (const there of [
+    "x-ot-session-id", "user-session-id", "x-ot-parent-session-id", "x-ot-trace-id",
+    "x-ot-span-id", "x-snap-traceid", "x-ot-function", "user-msg-id", "created-time",
+    "model-id", "model-name", "x-ot-client-type", "plugin-name", "ide-name", "x-language",
+  ]) {
+    assert.equal(h.has(there), true, `${there} is part of the kernel's chat identity`)
+  }
+  // Its own User-Agent names the kernel build, never a browser's — and is left off
+  // entirely when no build can be read.
+  const kernel = x.kernelVersion()
+  assert.equal(h.get("User-Agent"), kernel ? `opencode/${kernel}` : null)
+  // The `x-` prune leaves the transport's own headers alone.
+  assert.equal(h.get("content-type") !== null, true, "the body's content-type survives")
 })
 
 test("kernelVersion reads the build from the kernel file name, else says nothing", () => {
@@ -5177,8 +5441,176 @@ test("user-msg-id takes the kernel's shape: msg_, 12 hex, 14 base62", () => {
     assert.match(id, /^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
     assert.equal(id.length, 30)
   }
-  // and both headers carry the same id
-  assert.equal(typeof x.newMessageId, "function")
+})
+
+test("session ids take the kernel's shape too: ses_, 12 hex, 14 base62 — never 24 or 32", () => {
+  const digest = "0123456789abcdef".repeat(4)
+  const id = x.sessionIdFromDigest(digest)
+  assert.match(id, /^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
+  assert.equal(id.length, 30)
+  // One digest, one id: the pool derives the same slot the same way every time,
+  // which is what keeps the account's own state (its permits, its pool) together.
+  assert.equal(x.sessionIdFromDigest(digest), id)
+  assert.notEqual(x.sessionIdFromDigest("f".repeat(64)), id)
+  // The tail is the digest's own bytes: the same account keeps the same tail.
+  assert.equal(id.slice(4 + 12), x.sessionIdFromDigest(digest).slice(4 + 12))
+  assert.notEqual(id.slice(4 + 12), x.sessionIdFromDigest("f".repeat(64)).slice(4 + 12))
+  // A session's head stands still however often it is asked for.
+  for (let i = 0; i < 5; i++) assert.equal(x.sessionIdFromDigest(digest), id)
+  // A digest that holds nothing must not print `undefined` into the id.
+  for (const empty of ["", "zz"]) {
+    const odd = x.sessionIdFromDigest(empty)
+    assert.match(odd, /^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/, `${JSON.stringify(empty)} still gives a shaped id`)
+    assert.equal(odd.includes("undefined"), false)
+  }
+})
+
+test("an id's twelve hex characters are a recent moment, as the kernel writes them", () => {
+  // The head decodes back to milliseconds*4096 + counter, cut to 48 bits — the
+  // kernel's own encoding, checked against two real ids before it was written
+  // here. 48 bits hold about 795 days of milliseconds before they roll over, so
+  // compare the distance rather than the absolute value.
+  const MOD = 2 ** 36
+  const headMs = (id) => Number(BigInt(`0x${id.split("_")[1].slice(0, 12)}`) / 4096n) % MOD
+  const nearNow = (at, from, to) => {
+    const rel = (at - (from % MOD) + MOD) % MOD
+    return rel >= MOD - 2 || rel <= (to - from) + 2
+  }
+  const before = Date.now()
+  const ids = [x.newMessageId(), x.newMessageId(), x.newMessageId()]
+  const after = Date.now()
+  for (const id of ids) {
+    assert.match(id, /^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
+    assert.ok(nearNow(headMs(id), before, after), `${id} is not dated inside ${before}..${after}`)
+  }
+  // ids made in one millisecond still differ, as the kernel's counter keeps them
+  assert.equal(new Set(ids).size, 3)
+  // a session's head stands still for as long as the session does
+  const session = x.sessionIdFromDigest("a".repeat(64))
+  assert.ok(nearNow(headMs(session), before, after), `session ${session} is not dated inside the window`)
+})
+
+test("turnKeyOf: one key per user message, unmoved by the tool loop around it", () => {
+  const session = "ses_aabbccddeeffAbCdEfGhIjKlMn"
+  const user = { role: "user", content: "北京天气" }
+  const turn1 = [user]
+  // The tool loop appends assistant and tool turns; the key must not move.
+  const turn1Loop = [
+    user,
+    { role: "assistant", content: "查一下" },
+    { role: "tool", content: '{"ok":true}' },
+    { role: "assistant", content: "晴" },
+  ]
+  const k = x.turnKeyOf(session, { messages: turn1 })
+  assert.match(k.key, /^[0-9a-f]{32}$/)
+  assert.equal(x.turnKeyOf(session, { messages: turn1Loop }).key, k.key)
+  assert.equal(k.users, 1)
+  assert.match(k.textHash, /^[0-9a-f]{16}$/)
+  // A second user message is a new turn, even with the same text.
+  const second = x.turnKeyOf(session, { messages: [user, { role: "assistant", content: "晴" }, user] })
+  assert.notEqual(second.key, k.key)
+  assert.equal(second.users, 2)
+  assert.equal(second.textHash, k.textHash, "the same text is recognised as such")
+  // Another conversation never shares a turn, and no user turn names none.
+  assert.notEqual(x.turnKeyOf("ses_other", { messages: turn1 }).key, k.key)
+  assert.equal(x.turnKeyOf(session, { messages: [{ role: "assistant", content: "hi" }] }).key, "")
+})
+
+test("turnIdsOf: a tool loop repeats the turn's trace and message id, and only the span moves", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push(new Headers(init.headers))
+    return sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  const user = { role: "user", content: "跑一下测试" }
+  const ask = (messages) => loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages }))
+
+  await (await ask([user])).text()
+  // what the kernel's tool loop sends next: the same user turn, more history
+  await (await ask([user, { role: "assistant", content: "好" }])).text()
+  await (await ask([user, { role: "assistant", content: "好" }, { role: "tool", content: "ok" }])).text()
+  // and then a new user message
+  await (await ask([user, { role: "assistant", content: "好" }, { role: "tool", content: "ok" }, { role: "user", content: "再跑一次" }])).text()
+
+  const [a, b, c, d] = seen.map((h) => ({
+    trace: h.get("x-ot-trace-id"),
+    snap: h.get("x-snap-traceid"),
+    span: h.get("x-ot-span-id"),
+    msg: h.get("user-msg-id"),
+  }))
+  // measured: six requests of one turn repeated trace and message id
+  assert.equal(b.trace, a.trace, "the tool loop keeps the turn's trace")
+  assert.equal(c.trace, a.trace)
+  assert.equal(b.msg, a.msg, "the tool loop keeps the turn's user message id")
+  assert.equal(c.msg, a.msg)
+  // ... while the span and the snap suffix are per request
+  assert.notEqual(b.span, a.span)
+  assert.notEqual(b.snap, a.snap)
+  assert.equal(b.snap.split("_")[0], a.trace, "the snap trace names the turn's trace")
+  // a new user message is a new turn
+  assert.notEqual(d.trace, a.trace)
+  assert.notEqual(d.msg, a.msg)
+  assert.match(a.msg, /^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
+})
+
+test("the turn is keyed on the conversation, so a handed-on session slot does not move its ids", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push(new Headers(init.headers))
+    return sseResponse(okStream)
+  }
+  // One slot, so both conversations are sent under the very same upstream session
+  // id: if the turn were keyed on that id, their ids would collide.
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, maxInflight: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  const user = { role: "user", content: "同一句话" }
+  const ask = (conversation, messages) => loaded.fetch(x.CHAT_API_BASE + "/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json", [x.CONVERSATION_HEADER]: conversation },
+    body: JSON.stringify({ model: "GLM-5.2", messages, stream: true }),
+  })
+
+  await (await ask("conversation-one", [user])).text()
+  await (await ask("conversation-two", [user])).text()
+  // conversation one comes back to its turn
+  await (await ask("conversation-one", [user, { role: "assistant", content: "好" }])).text()
+
+  const [one, two, oneAgain] = seen.map((h) => ({
+    session: h.get("x-ot-session-id"),
+    trace: h.get("x-ot-trace-id"),
+    msg: h.get("user-msg-id"),
+  }))
+  assert.equal(one.session, two.session, "one slot, so both go out under one session id")
+  assert.notEqual(one.trace, two.trace, "two conversations are two turns")
+  assert.notEqual(one.msg, two.msg)
+  assert.equal(oneAgain.trace, one.trace, "its own turn's trace, slot churn or not")
+  assert.equal(oneAgain.msg, one.msg)
+})
+
+test("a history compacted mid-turn keeps the turn's ids; a new turn of the same words does not", async () => {
+  // The account state a chat request runs against, driven directly: the ids must
+  // follow the user message, not the count that a compaction can lower.
+  const state = { turns: new Map(), lastTurn: new Map() }
+  const convo = "conversation-one"
+  const user = { role: "user", content: "跑一下测试" }
+  const ask = (messages) => x.turnIdsOf(state, x.turnKeyOf(convo, { messages }))
+  const others = [{ role: "assistant", content: "好" }, { role: "tool", content: "ok" }]
+
+  const first = ask([user])
+  // The loop grows the history: same ids.
+  assert.equal(ask([user, ...others]).messageId, first.messageId)
+  // Then the host compacts it, dropping the earlier user turns it had summarised:
+  // the same last user message, with fewer of them, is still this turn.
+  const compacted = ask([user])
+  assert.equal(compacted.traceId, first.traceId, "a compacted history does not restart the turn")
+  assert.equal(compacted.messageId, first.messageId)
+  // A later turn that happens to repeat the same words is a new turn: it carries
+  // one more user message than the high-water mark.
+  const repeated = ask([{ role: "user", content: "早先的话" }, { role: "assistant", content: "嗯" }, user])
+  assert.notEqual(repeated.traceId, first.traceId)
+  assert.notEqual(repeated.messageId, first.messageId)
 })
 
 test("clientVersion never guesses: unreadable means empty, so the version headers are left off", () => {
@@ -5194,25 +5626,51 @@ test("clientVersion never guesses: unreadable means empty, so the version header
   assert.equal(x.CLIENT_VERSION_FALLBACK, undefined)
 })
 
-test("with no version to claim, the chat leaves those three headers off and still names the client", async () => {
+test("with no version to claim, the chat leaves those three headers off and does not seal", async () => {
   const seen = []
   const fetcher = async (url, init = {}) => {
-    seen.push(new Headers(init.headers))
+    seen.push({ url: String(url), headers: new Headers(init.headers) })
     return sseResponse(okStream)
   }
-  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  // sm4 on, but no version to claim: an older client claims no build and does not
+  // seal its body, so this request must do neither.
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, sm4: true, clientVersion: "" })
   const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
   await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
-  const h = seen[0]
+  // No key exchange: sealing would have negotiated one first.
+  assert.equal(seen.some((s) => s.url.includes(x.KEY_EXCHANGE_PATH)), false, "no version, no seal")
+  const h = seen[0].headers
+  for (const k of ["X-Encrypt-Algo", "X-Encrypt-Key-Id", "X-Encrypt-Iv", "X-Encrypt-Tag", "X-Encrypt-Ts"]) {
+    assert.equal(h.has(k), false, `${k} belongs to a sealed request`)
+  }
   // the identity that needs no version is still there
   assert.equal(h.get("plugin-name"), "codemate_vscode")
   assert.equal(h.get("ide-name"), "VSCode")
   assert.equal(h.get("x-ot-client-type"), "IDE")
   // and nothing claims a version this process could not read
   for (const k of ["plugin-version", "ide-version", "x-ot-client-version"]) {
-    const v = h.get(k)
-    assert.ok(v === null || v === "26.11.200", `${k} must be absent or the real build, got ${v}`)
+    assert.equal(h.get(k), null, `${k} must be left off when no version is known`)
   }
+})
+
+test("a version it can claim sends the version headers, and tries to seal", async () => {
+  const seen = []
+  const fetcher = async (url, init = {}) => {
+    seen.push({ url: String(url), headers: new Headers(init.headers) })
+    // A stub that answers SSE to everything: the key exchange cannot be parsed,
+    // so the chat falls back to plaintext (the client's own fallbackOnFailure).
+    return sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, sm4: true, clientVersion: "26.11.200" })
+  const loaded = await plugin.auth.loader(async () => makeAuth(await makeCred()))
+  await (await loaded.fetch(x.CHAT_API_BASE + "/chat/completions", chatInit({ model: "GLM-5.2", messages: [] }))).text()
+  // It asked for a key: sealing was attempted, not skipped.
+  assert.equal(seen.some((s) => s.url.includes(x.KEY_EXCHANGE_PATH)), true, "a claimed version seals")
+  const chat = seen.find((s) => s.url.includes("/chat/completions")).headers
+  assert.equal(chat.get("plugin-version"), "26.11.200")
+  assert.equal(chat.get("ide-version"), "26.11.200")
+  assert.equal(chat.get("x-ot-client-version"), "26.11.200")
+  assert.equal(chat.has("X-Encrypt-Algo"), false, "a failed negotiation falls back to plaintext")
 })
 test("the IDE is found without anyone setting an env var: registry, then the kernel file name", () => {
   // a fake kernel install: the file name carries both versions
@@ -5236,6 +5694,69 @@ test("ideInstallDir honours the env var and can be kept off the host's records",
   assert.equal(x.ideInstallDir({ env: {}, platform: "linux", noDiscovery: true }), "")
   // an env var pointing at something that is not an IDE app is not taken
   assert.equal(x.ideInstallDir({ env: { MAGPIE_CODEARTS_IDE_DIR: os.tmpdir() }, platform: "linux", noDiscovery: true }), "")
+})
+
+test("ideInstallDir takes the env var's install, and the version it carries, without discovery", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codearts-idedir-"))
+  try {
+    fs.mkdirSync(path.join(root, "resources", "app"), { recursive: true })
+    fs.writeFileSync(path.join(root, "resources", "app", "product.json"), JSON.stringify({ version: "26.11.200" }))
+    assert.equal(x.ideInstallDir({ env: { MAGPIE_CODEARTS_IDE_DIR: root }, platform: "linux", noDiscovery: true }), root)
+    // and the version read from there is the one a chat claims
+    assert.equal(x.clientVersion({ env: { MAGPIE_CODEARTS_IDE_DIR: root } }), "26.11.200")
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("one key negotiation per host at a time: chats in flight share it", async () => {
+  const ecdh = crypto.createECDH("prime256v1")
+  ecdh.generateKeys()
+  let exchanges = 0
+  const negotiator = x.createKeyNegotiator()
+  const exchange = async () => {
+    exchanges += 1
+    // A negotiation that takes a moment, so the three calls really overlap.
+    await new Promise((r) => setTimeout(r, 20))
+    return { serverPublicKey: ecdh.getPublicKey().toString("base64"), keyId: `kid-${exchanges}`, expiresIn: 7200 }
+  }
+  const [a, b, c] = await Promise.all([
+    negotiator.getKey("https://host", exchange),
+    negotiator.getKey("https://host", exchange),
+    negotiator.getKey("https://host", exchange),
+  ])
+  assert.equal(exchanges, 1, "three chats, one exchange")
+  assert.equal(a.keyId, b.keyId)
+  assert.equal(a.keyId, c.keyId)
+  // the cached key answers the next request without one
+  await negotiator.getKey("https://host", exchange)
+  assert.equal(exchanges, 1)
+  // a refused key is dropped, and the next request negotiates again
+  negotiator.forget("https://host", a.keyId)
+  await negotiator.getKey("https://host", exchange)
+  assert.equal(exchanges, 2)
+})
+
+test("client-ip is the host's own address, or the one written by hand, or nothing when off", () => {
+  // off wins over everything
+  assert.equal(x.clientIp({ [x.CLIENT_IP_ENV]: "off" }), "")
+  assert.equal(x.clientIp({ [x.CLIENT_IP_ENV]: "OFF" }), "")
+  // an address written by hand is sent verbatim: the user is describing their own
+  // network, and the kernel reports whatever its interface carries
+  assert.equal(x.clientIp({ [x.CLIENT_IP_ENV]: "10.2.3.4" }), "10.2.3.4")
+  assert.equal(x.clientIp({ [x.CLIENT_IP_ENV]: " 203.0.113.9 " }), "203.0.113.9")
+  // anything else falls back to the host's own interface — and that is either a
+  // private IPv4 or nothing at all, never an address the kernel would not report
+  const host = x.clientIp({})
+  assert.ok(host === "" || x.PRIVATE_IPV4.test(host), `unexpected host address: ${host}`)
+  assert.equal(x.clientIp({ [x.CLIENT_IP_ENV]: "not-an-address" }), host)
+  // the private ranges the kernel reports are recognised the way it writes them
+  for (const ip of ["10.1.1.147", "192.168.1.5", "172.16.0.2", "172.31.255.254"]) {
+    assert.ok(x.PRIVATE_IPV4.test(ip), `${ip} is private`)
+  }
+  for (const ip of ["172.32.0.1", "8.8.8.8", "127.0.0.1", "10.1.1", "300.1.1.1"]) {
+    assert.equal(x.PRIVATE_IPV4.test(ip), false, `${ip} is not a private IPv4`)
+  }
 })
 
 test("user_prompt is the last user turn as the kernel sends it", () => {

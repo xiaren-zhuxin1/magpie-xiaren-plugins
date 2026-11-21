@@ -19,7 +19,7 @@ CodeArts（华为云码道）认证 provider 插件，用于 [magpie](https://us
 
 ## 验证状态
 
-- 225 个单元测试中 224 通过，1 个为 Windows 临时目录清理的已知 flaky（已用未改动的 HEAD 基线复现证明与本改动无关）。
+- 249 个单元测试全通过（`bun test`）。临时目录清理在 Windows 上会重试，不再把已通过的测试判失败；`sm4-ctr` 交叉校验在该运行时没有这个 cipher 时跳过并打印一行说明。
 - 运行时实测：内核端口发现、`/v1/init` 配置、真实 OAuth authorize URL、真实 chat 请求头均已抓包确认。
 - 详见同目录或上游归档的 `CodeArts_运行时验证报告_2026-11-17.md`。
 
@@ -210,8 +210,10 @@ rate), shown as `DeepSeek-V4.1-Flash-1017`, not folded into `DeepSeek-V4.1-Flash
   else the IDE version in the kernel file name — and with none of them, those
   rather than guessed: a claimed 26.11.100 beside a sealed body (a 26.11.200 behaviour)
   would be a contradiction, where a missing header only reads as a version difference.
-  `MAGPIE_CODEARTS_CLIENT_IP=off` leaves `client-ip` off (behind a proxy the address this host
-  sees is not the one the request leaves from).
+  `MAGPIE_CODEARTS_CLIENT_IP` decides the `client-ip` outright: `off` sends none (behind a proxy
+  the address this host sees is not the one the request leaves from), and an IPv4 written there
+  is sent as it is — the way a machine with several private addresses (a Hyper-V or Docker
+  adapter beside the cable) says which one it would really name.
 - **One conversation is one upstream session** (since 0.3.25). The real kernel sends its
   conversation id as `x-ot-session-id`, so each conversation uses one of the account's three
   sessions instead of the whole account sharing one id. An account keeps a pool of at most
@@ -225,12 +227,14 @@ rate), shown as `DeepSeek-V4.1-Flash-1017`, not folded into `DeepSeek-V4.1-Flash
 - Usage: the credit buckets of `snap-manager/v1/statistics/plugin` (only the package total
   pauses the account; the basic / on-demand / bonus buckets are shown aside) and the free daily
   token pool.
-- When each credit batch expires is read from the CodeArts console's own calls
-  (`snap-manager/v1/package/credit/page`, `v1/ops/credit/*`); when those can't be read, the
-  plugin falls back to a small ledger of the check-ins it claimed,
+- When each credit batch expires is read from the credit-batch calls the CodeArts console used to
+  make (`snap-manager/v1/package/credit/page`, `v1/ops/credit/*`). Since 2026-11-21 the gateway
+  publishes neither ("APIG.0101: The API does not exist or has not been published"), so one
+  answer of that kind settles it for the account and the plugin stops asking; the card then goes
+  on from a small ledger of the check-ins it claimed,
   `~/.config/magpie/codearts-checkins.json` (or `MAGPIE_CODEARTS_LEDGER`), each check-in until
-  the date its claim named. This part is still being checked against more accounts — trust the
-  CodeArts console where they differ.
+  the date its claim named, and from the plan's `end_date`. This part is still being checked
+  against more accounts — trust the CodeArts console where they differ.
 - A window's `runsOutAt` / `runsOut` is only credit its own remainder holds: none when the bucket
   is empty, never more than it has left, and the total's is the buckets' own. The ledger can't
   tell what was spent of a check-in, so from it the amount is the vendor's own
@@ -334,6 +338,7 @@ under **Settings → Usage → Plugins**.
 | `queueBudgetMs` | `300000` | how long to wait in the gateway's queue |
 | `thinking` | `true` | `false` stops adding `thinking: { type: "enabled" }` |
 | `sm4` | `true` | `false` stops sealing the chat body with SM4-GCM (see below) |
+| `clientVersion` | *(the installed IDE)* | a version to claim; `""` claims none, which also stops sealing (see 客户端身份) |
 
 ### SM4-GCM transport encryption (CodeArts Agent 26.11.200)
 
@@ -355,11 +360,17 @@ measured chat went out sealed and came back sealed, with no plaintext bypass for
 `/api/v2/chat/completions`. A sealed call spends one key-exchange request (cached
 for 2 hours), and a failed negotiation — or a sealed call the gateway refuses —
 falls back to plaintext automatically (the client's own `fallbackOnFailure`),
-retrying once after dropping the cached key. Only `/api/v2/chat/completions` is
-sealed and every other signed call stays plaintext. Node's OpenSSL has no
-`sm4-gcm` cipher, so GCM is built here from `sm4-ecb`/`sm4-ctr` with no
-dependency added; its GHASH is verified against NIST's AES-GCM vectors and its
-keystream against Node's `sm4-ctr`.
+retrying once after dropping the cached key. Only a refusal the seal can be blamed
+for falls back: a session cap (any `TM.*` code), a queue answer, a spent quota, a
+stale credential or a server fault goes on as it came, because a plaintext copy would
+spend a second request on an account already at its limit and drop a key that still
+works. Only `/api/v2/chat/completions` is sealed and every other signed call stays
+plaintext. Sealing also needs a version to claim: a request that names no client build
+goes out plaintext, since the only build that seals names its own version (see
+客户端身份). Node's OpenSSL has no `sm4-gcm` cipher, so GCM is built here from
+`sm4-ecb`/`sm4-ctr` with no dependency added; its GHASH is verified against NIST's
+AES-GCM vectors and, where the runtime still has the cipher, its keystream against
+Node's `sm4-ctr`.
 
 To keep the old plaintext behaviour, set `sm4: false`:
 
@@ -391,7 +402,7 @@ anything; the env var only overrides what is found. On startup the plugin logs t
 | `MAGPIE_CODEARTS_PLUGIN_VERSION` | from the found IDE's auth extension, else `5.2.0` | Override the `plugin-version`. |
 | `MAGPIE_CODEARTS_THEME` | `2` | Override `theme` (`activeColorTheme.kind`: 1 = Light, 2 = Dark). The plugin does **not** read the host's current theme; use this to match a Light-theme IDE. |
 | `MAGPIE_CODEARTS_CLIENT_VERSION` | the found IDE's `product.json`, else the IDE version in the kernel file name; with neither, nothing is claimed (those headers are left off) | What chat claims as `plugin-version` / `ide-version`. Overrides the discovery. |
-| `MAGPIE_CODEARTS_CLIENT_IP` | _(unset)_ | `off` leaves `client-ip` off — for use behind a proxy, where the address this host sees is not the one the request leaves from. |
+| `MAGPIE_CODEARTS_CLIENT_IP` | the host's own private IPv4 | `off` leaves `client-ip` off — for use behind a proxy, where the address this host sees is not the one the request leaves from. An IPv4 written here is sent as it is, for a machine whose several private addresses need one picked. |
 
 Resolution is cached for the life of the process, so an IDE upgrade or an env change takes effect
 after a restart. To confirm what is in use, sign in once and read the `service: codearts`
@@ -459,7 +470,11 @@ measurements and code of [HuHong-Tao](https://github.com/yuweihao17/codearts/pul
   0.2.4 起所有模型都声明为只收文本（码道对图片回 `InferHub.001001020.406`「The request model is not multimodal」），
   magpie 会替模型描述图片或把图片略去；这个拒绝不论放在 200 里还是带别的状态码，都换算为 `400`，而不是让智能体反复重试的 `502`。
 - **X-Language**（0.3.24 起）：所有签名请求都带同一个 `X-Language`，在**签名之后**设置，因此不进入 `SignedHeaders`。它跟随 IDE 语言（默认 `zh-cn`），不随站点——真实内核在国际站、中文 IDE 下发的也是 `zh-cn`。英文 IDE 用环境变量 `MAGPIE_CODEARTS_LOCALE=en-us` 覆盖。对话请求不发 `lang`、`Chat-Id`、`Session-Id`，会话只认 `x-ot-session-id`。
-- **客户端身份**（0.3.25 起，0.3.26 补齐）：每个对话请求还带上真实内核自报的身份，取自 `[header-debug] full headers` 实测：`x-ot-client-type: IDE`、`x-ot-client-version`、`plugin-name: codemate_vscode`、`plugin-version`、`ide-name: VSCode`、`ide-version`、`x-ot-function: agent-claw`、`x-message-id`、`model-id`/`model-name`（显示名，URL 编码）、每请求新的 `user-msg-id` 与 `created-time`、`x-session-affinity`、`x-session-user-message`、`X-Encrypt-Capable`、`User-Agent: opencode/<内核build>`，以及本机私网 IPv4 的 `client-ip`。这些都在签名之后设置，不进入 `SignedHeaders`。会话 id 用内核的 `ses_`+24 位形态，消息 id 用 `msg_`+12 位 hex+14 位形态。**版本号只从本机 IDE 的 `resources/app/product.json` 或 `MAGPIE_CODEARTS_CLIENT_VERSION` 取；两者都没有时，`plugin-version`/`ide-version`/`x-ot-client-version` 全部不发**——猜一个旧版本（如 26.11.100）却用着 26.11.200 才有的加密，会构成自相矛盾，而缺一个头只算版本差异。`MAGPIE_CODEARTS_CLIENT_IP=off` 可关掉 `client-ip`（走代理时本机看到的地址与出口地址不一致）。
+- **客户端身份**（0.3.25 起，0.3.27 补齐）：每个对话请求带上真实内核自报的身份，取自 `[header-debug] full headers` 实测：`x-ot-client-type: IDE`、`x-ot-client-version`、`plugin-name: codemate_vscode`、`plugin-version`、`ide-name: VSCode`、`ide-version`、`x-ot-function: agent-claw`、`model-id`/`model-name`（显示名，URL 编码）、`user-msg-id` 与 `created-time`、`User-Agent: opencode/<内核build>`，以及本机私网 IPv4 的 `client-ip`。这些都在签名之后设置，不进入 `SignedHeaders`。
+  只发这些：内核的 provider 会按一张白名单重建请求头（`getInferhubHcHeaders` 返回的是重建出的集合，不是与调用方头的合并），所以对话请求上的每一个 `x-…` 头都要在白名单里，其余一律删掉——`x-message-id`、`x-session-affinity`、`x-session-user-message`、`X-Encrypt-Capable` 在 `_existingHeaders` 里有、在 `full headers` 里没有，真客户端从不发它们。`User-Agent` 是唯一保留的 SDK 自带头，因为它在真客户端里是传输层的默认值，值同样是 `opencode/<内核build>`。
+- **id 的形态**（0.3.27 起）：内核铸造的每个 id 都是 `<prefix>_` + 12 位小写 hex + 14 位 base62（前缀后共 26 个字符），而 hex 段是 `(毫秒 * 4096 + 同毫秒计数)` 取低 48 位——也就是创建时刻。所以会话 id 是 `ses_` + 26、消息 id 是 `msg_` + 26，且头能解回一个刚刚的时间；24 位、32 位 hex，或头解不回时间的 id，一眼就不是这个客户端发的。会话 id 的头在会话期内不动（按账号记住）。
+- **trace 与消息 id 的粒度是一回合，不是一请求**（0.3.27 起）：实测同一轮工具循环连发 6 次请求，`x-ot-trace-id` 与 `user-msg-id` 六次全同，只有 `x-ot-span-id` 和 `x-snap-traceid` 的 `_` 后缀每次变（`messageCount` 从 4 一路涨到 22）。magpie 的 `chat.headers` 钩子不给消息 id（`message.id` 恒为空串），所以回合从请求体本身读：**最后一条 user 消息 + 历史里 user 消息的条数**——工具循环里两者都不动，出现新的 user 消息时两者都变。回合 id 按内容寻址保存在账号状态里（至多 128 个，最久未用的先淘汰），所以一轮对话结束后再回来仍拿回同一组 id；历史在回合中途被压缩（条数变少、最后一条 user 消息不变）时也认作同一回合，不会中途换 id。
+  **版本号只从本机 IDE 的 `resources/app/product.json`、内核文件名或 `MAGPIE_CODEARTS_CLIENT_VERSION` 取；读不到时，`plugin-version`/`ide-version`/`x-ot-client-version` 全部不发，并且这条请求不加密**——自称老客户端（不报版本）却做 26.11.200 才有的加密，是真实客户端绝不会出现的组合；缺一个头只算版本差异。
 - **一个对话一个上游会话**（0.3.25 起）：真实内核把对话 ID 放在 `x-ot-session-id`，所以每个对话各占账号三个会话额度中的一个，而不是全账号共用一个 id。账号维护至多三个 id 的池：对话活跃期间及静默 `90` 秒内保持自己的 id（网关会持有已结束的会话约一分钟），之后才可能把槽位让给别的对话——这样第 4 个对话也不会开出网关会拒绝的会话（`TM.00001041`）。
 - **用量与签到**：总积分决定账号是否可用，其余积分桶只做明细；另有每日免费额度窗口。各批积分的到期
   时间读自码道控制台同一批接口，读不到时退回插件的签到账本 `~/.config/magpie/codearts-checkins.json`
