@@ -1,0 +1,37 @@
+{
+  "name": "@magpie-community/opencode-doubao-web-auth",
+  "version": "0.1.0",
+  "description": "Doubao (豆包) desktop client as a magpie provider: the client's own signed-in web session, driven over CDP, serving samantha chat/completion as an OpenAI-compatible stream",
+  "type": "module",
+  "main": "./opencode.mjs",
+  "exports": {
+    ".": "./opencode2.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test"
+  },
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "provider",
+    "doubao",
+    "豆包",
+    "cdp"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magpie-community/plugins.git",
+    "directory": "packages/doubao"
+  },
+  "magpie": {
+    "maxConcurrency": 3
+  }
+}

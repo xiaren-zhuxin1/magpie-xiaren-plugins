@@ -1,0 +1,1 @@
+export { DoubaoPlugin } from "./index.mjs"
