@@ -1,0 +1,25 @@
+# Line endings
+#
+# Everything here is stored as LF, and checked out as LF, so a comparison between
+# two copies of one file is byte-exact. That matters twice over:
+#
+# - CodeArts' files were once rewritten as CRLF, which turned a 40-line change
+#   into a 12137-line diff, and every review, blame and cherry-pick after it
+#   would have carried that noise.
+# - `scripts/check.mjs` compares a package's `opencode2.mjs` with the canonical
+#   copy in `scripts/` byte for byte. With this repository's `core.autocrlf=true`
+#   those two checked out with different endings and the check failed on a file
+#   that was in fact identical.
+#
+# Binaries keep their own bytes.
+.gitattributes     text eol=lf
+scripts/**         text eol=lf
+packages/codearts/** text eol=lf
+
+*.exe              binary
+*.tgz              binary
+*.png              binary
+*.ico              binary
+*.webp             binary
+*.ttf              binary
+*.bin              binary
